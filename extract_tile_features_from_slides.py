@@ -42,8 +42,12 @@ from tqdm import tqdm
 from keras.applications.resnet50 import ResNet50
 from keras.models import Model
 from keras.applications.resnet50 import preprocess_input
+from concurrent.futures import ThreadPoolExecutor
 import random
 import uuid
+random.seed(42)
+np.random.seed(42)
+
 
 def _l0_downsample_for_dz_level(zoom, dz_level):
     # Deep Zoom levels are power-of-two downsamples of level-0 dimensions
@@ -88,15 +92,27 @@ def extract_tile_features(dz_level, coord, zoom, tile_size, clam_l0_mode=False):
         tile = np.array(zoom.get_tile(dz_level, (tile_col, tile_row)))
     else:
         tile = np.array(zoom.get_tile(dz_level, (coord[1], coord[2])))
-    tile_img = Image.fromarray(tile)
-    tile_img = to_pil(cca.stretch(from_pil(tile_img)))
-    tile = np.array(tile_img)
-    # Add a 1 in 100 chance to save an example tile image (for debug/visualization)
-    if random.randint(1, 1000) == 1:
+    # tile_img = Image.fromarray(tile)
+    # tile_img = to_pil(cca.stretch(from_pil(tile_img)))
+    # tile = np.array(tile_img)
+    tile = cca.stretch(tile)
+    
+    # Ensure tile is exactly tile_size x tile_size x 3 (edge tiles may be smaller)
+    if tile.shape[:2] != (tile_size, tile_size):
+        # Resize to exact size using PIL (handle PIL version differences)
+        print(f"Resizing tile from {tile.shape[:2]} to {tile_size}x{tile_size}")
+        tile_img = Image.fromarray(tile)
+        resample = getattr(Image, 'Resampling', Image).LANCZOS
+        tile_img = tile_img.resize((tile_size, tile_size), resample)
+        tile = np.array(tile_img)
+    
+    # Add a 1 in 1000 chance to save an example tile image (for debug/visualization)
+    if random.randint(1, 4000) == 1:
         example_dir = os.path.join(os.getcwd(), "tile_examples")
         os.makedirs(example_dir, exist_ok=True)
         # Use uuid4 to guarantee no collisions, save as PNG
         filename = f"tile_example_{uuid.uuid4().hex}.png"
+        tile_img = Image.fromarray(tile)
         tile_img.save(os.path.join(example_dir, filename))
     return tile
 
@@ -115,17 +131,20 @@ def save_numpy_features(path2slides, folder, slidename, coords, path, tile_size,
     else:
         dz_level = _pick_dz_level_for_target_mpp(slide, zoom, target_mpp)
         print("Calculated dz_level for target mpp:", dz_level)
-    tiles = np.array([extract_tile_features(dz_level, coord, zoom, tile_size, clam_l0_mode=clam_l0_mode) for coord in tqdm(coords)])
+    # Parallelize extraction over 8 worker threads
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        tiles_iter = ex.map(lambda c: extract_tile_features(dz_level, c, zoom, tile_size, clam_l0_mode=clam_l0_mode), coords)
+        tiles = np.array(list(tqdm(tiles_iter, total=len(coords), mininterval=5)))
     tiles = preprocess_input(tiles)
-    X = model.predict(tiles, batch_size=32)
+    X = model.predict(tiles, batch_size=32, verbose=2)
     X = np.concatenate([coords, X], axis=1)
     np.save(os.path.join(path, '0.50_mpp', slidename.split('.')[0] + '.npy'), X)
 
 def process_all_slides(path2slides, tile_coords, path, tile_size, clam_l0_mode=False):
-
+    print("process_all_slides function called")
     subfolder = {}
     slide_dirs = [d for d in os.listdir(path2slides) if os.path.isdir(os.path.join(path2slides, d))]
-
+    # print("slide_dirs", slide_dirs)
     slidenames = []
     subfolders = []
 
@@ -139,10 +158,22 @@ def process_all_slides(path2slides, tile_coords, path, tile_size, clam_l0_mode=F
         os.mkdir(path)
     if not os.path.exists(os.path.join(path, '0.50_mpp')):
         os.mkdir(os.path.join(path, '0.50_mpp'))
+    # print("subfolders", subfolders)
+    # print("slidenames", slidenames)
+    output_dir = os.path.join(path, '0.50_mpp')
+    coord_keys_truncated = {}
+    for key in tile_coords.keys():
+        coord_keys_truncated[key[:23]] = key
 
-    for folder, slidename in zip(subfolders, slidenames):
-        if slidename in tile_coords.keys():
-            save_numpy_features(path2slides, folder, slidename, tile_coords[slidename], path, tile_size, clam_l0_mode=clam_l0_mode)
+    for folder, slidename in tqdm(list(zip(subfolders, slidenames)), desc="Processing slides"):
+        print(f'Processing {slidename}')
+        if slidename[:23] in coord_keys_truncated.keys():
+            # Check if output file already exists
+            output_file = os.path.join(output_dir, slidename.split('.')[0] + '.npy')
+            if os.path.exists(output_file):
+                print(f'Skipping {slidename}: output file already exists at {output_file}')
+                continue
+            save_numpy_features(path2slides, folder, slidename, tile_coords[coord_keys_truncated[slidename[:23]]], path, tile_size, clam_l0_mode=clam_l0_mode)
         else:
             print(f'Warning: tile coordinates not found for file {slidename}, skipping it')
 
@@ -165,6 +196,12 @@ def main():
     tile_size = int(args.tile_size)
     clam_l0_mode = args.clam_l0_mode
     clam_l0_mode = True if clam_l0_mode == 'True' else False
+    print("main function called")
+    print("path2slides", path2slides)
+    print("path", path)
+    # print("tile_coords", tile_coords)
+    print("tile_size", tile_size)
+    print("clam_l0_mode", clam_l0_mode)
     process_all_slides(path2slides, pkl.load(open(tile_coords, 'rb')), path, tile_size, clam_l0_mode)
     
 if __name__ == '__main__':

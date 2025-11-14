@@ -16,15 +16,18 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 import os
+import argparse
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 from constant import PATH_TO_TILES, PATH_TO_TRANSCRIPTOME
 
+PATH_TO_TILES = "/gpfs/work4/0/prjs1086/pepsi/data/processed/tcga_resnet_feats"
+PATH_TO_TRANSCRIPTOME = "/gpfs/work4/0/prjs1086/pepsi/data/raw/tcga_rna/"
 
 class TranscriptomeDataset:
     """A class for dealing with RNAseq data and matching them with available
-    slides.
+    slides. Note: high memory usage when loading many transcriptomes (>1000).
 
     Args:
         projectname (list): If None, all TCGA projects are included.
@@ -37,18 +40,29 @@ class TranscriptomeDataset:
         self.projectname = projectname
         self.genes = genes
 
-        transcriptome_metadata = pd.read_csv(
-            os.path.join(
-                'metadata',
-                'samples_description.csv'),
-            sep='\t')
+        # transcriptome_metadata = pd.read_csv(
+        #     os.path.join(
+        #         'metadata',
+        #         'samples_description.csv'),
+        #     sep='\t')
+        transcriptome_metadata = pd.read_csv("/home/dvanerp/pepsi/data/raw/master_tcga_keyfile_with_sample_type.csv", sep=',', engine='pyarrow')
+        
+        # Instead of inferring Sample.ID and Case.ID from slide_filename like below, I requested the Case.ID and Sample.ID from the GDC API and added them to the metadata file.
+   
+        # transcriptome_metadata['Sample.ID'] = transcriptome_metadata['slide_filename'].apply(lambda x: x[:16])
 
+        # # Set 'Case.ID' based on 'File.Name':
+        # transcriptome_metadata['Case.ID'] = transcriptome_metadata['slide_filename'].apply(lambda x: x[:12])
+
+        # # For now, this sets all as 'Primary Tumor':
+        # transcriptome_metadata['Sample.Type'] = 'Primary Tumor'
+        
         # Select primary tumor samples from the chosen project
         if self.projectname is not None:
             directories = [
-                project.replace('_', '-') for project in self.projectname]
+                project for project in self.projectname]
             self.transcriptome_metadata = transcriptome_metadata.loc[
-                (transcriptome_metadata['Project.ID'].isin(directories)) &
+                (transcriptome_metadata['Project.ID'].isin(directories))  &
                 (transcriptome_metadata['Sample.Type'] == 'Primary Tumor')]
         else:
             self.transcriptome_metadata = transcriptome_metadata.loc[
@@ -65,13 +79,11 @@ class TranscriptomeDataset:
             usecols = None
         else:
             usecols = list(genes) + ['File.ID', 'Sample.ID', 'Case.ID', 'Project.ID']
-        transcriptomes = pd.read_csv(path, usecols=usecols)
+        transcriptomes = pd.read_csv(path, usecols=usecols, engine='pyarrow')
         if projectname is None:
-            projectname = transcriptomes['Project.ID'].apply(
-                lambda x: x.replace('-', '_')).unique()
+            projectname = transcriptomes['Project.ID']
         else:
-            transcriptomes = transcriptomes.loc[transcriptomes['Project.ID'].apply(
-                lambda x: x.replace('-', '_')).isin(projectname)]
+            transcriptomes = transcriptomes.loc[transcriptomes['Project.ID'].isin(projectname)]
         genes = [col for col in transcriptomes.columns if col.startswith('ENSG')]
         dataset = cls(projectname, genes)
         transcriptomes.sort_values('Sample.ID', inplace=True)
@@ -86,7 +98,7 @@ class TranscriptomeDataset:
 
         if subdirs is not None:
             df = []
-            for subdir in subdirs:
+            for subdir in tqdm(subdirs, desc="getting metadata per slide feature", mininterval=4, total=len(subdirs)):
                 dir_tiles = os.path.join(PATH_TO_TILES, subdir, zoom)
                 filenames = [f for f in os.listdir(dir_tiles) if f.endswith('.npy') and 'mask' not in f]
                 case_ids = [f[:12] for f in filenames]
@@ -98,6 +110,7 @@ class TranscriptomeDataset:
                      'ID': full_ids, 'Slide.ID': filenames}))
             return pd.concat(df)
         else:
+            print("No projectname filters provided, getting subdirs for all TCGA projects in PATH_TO_TILES")
             subdirs = []
             for subdir in os.listdir(PATH_TO_TILES):
                 if os.path.isdir(os.path.join(PATH_TO_TILES, subdir)) and subdir.startswith('TCGA'):
@@ -120,12 +133,20 @@ class TranscriptomeDataset:
         self.metadata.sort_values('Sample.ID', inplace=True)
         self.metadata.reset_index(inplace=True, drop=True)
 
-    def load_transcriptomes(self):
+    def load_transcriptomes(self, csv_path=None):
         """Select transcriptomic data of the selected project and genes.
         """
-        df = pd.read_csv(os.path.join(
-            PATH_TO_TRANSCRIPTOME,
-            'transcriptome_fpkmuq_allsamps.csv'), sep='\t', usecols=self.genes, index_col=0)
+        if csv_path is None:
+            csv_path = Path(PATH_TO_TRANSCRIPTOME) / 'transcriptome_fpkmuq_allsamps.csv'
+        else:
+            csv_path = Path(csv_path)
+
+        df = pd.read_csv(
+            csv_path,
+            sep='\t',
+            usecols=self.genes,
+            index_col=0,
+            engine='pyarrow')
 
         df['File.ID'] = df.index
         df = df.merge(self.metadata[['File.ID', 'Sample.ID',
@@ -137,17 +158,63 @@ class TranscriptomeDataset:
 
         
 def main():
-    df = []
-    path = Path(PATH_TO_TRANSCRIPTOME)
-    for f in tqdm(path.glob('*/*.txt')):
-        df_ = pd.read_csv(f, sep='\t', header=None, index_col=0)
-        df_.columns = [str(f).split('/')[-2]]
-        df.append(df_.T)
-    df = pd.concat(df)
-    df.to_csv(path / 'transcriptome_fpkmuq_allsamps.csv', index=True, sep='\t')
+    parser = argparse.ArgumentParser(
+        description="Build or reuse aggregated TCGA transcriptome data and load it into a TranscriptomeDataset.")
+    parser.add_argument(
+        "--input-csv",
+        type=Path,
+        default=Path(PATH_TO_TRANSCRIPTOME) / 'transcriptome_fpkmuq_allsamps.csv',
+        help="Path to an existing aggregated transcriptome file. Defaults to PATH_TO_TRANSCRIPTOME/transcriptome_fpkmuq_allsamps.csv.")
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Force regeneration of the aggregated transcriptome file even if it already exists.")
+    args = parser.parse_args()
+
+    target_csv = args.input_csv.expanduser().resolve()
+    source_dir = Path(PATH_TO_TRANSCRIPTOME)
+
+    if args.force_rebuild or not target_csv.exists():
+        print(f"Generating aggregated transcriptome file at {target_csv}")
+        target_csv.parent.mkdir(parents=True, exist_ok=True)
+        df = []
+        tsv_files = list(source_dir.rglob('**/*.tsv'))
+        for f in tqdm(tsv_files, desc="Loading transcriptomes from folders", total=len(tsv_files), mininterval=3):
+            df_ = pd.read_csv(
+                f,
+                sep='\t',
+                comment='#',                     # skip the first `# gene-model…` line
+                usecols=['gene_id', 'tpm_unstranded'],
+                engine='pyarrow'
+            )
+            df_ = df_.loc[df_['gene_id'].str.startswith('ENSG')].set_index('gene_id')
+            df_.columns = [f.parent.name]        # use the File ID folder as the sample name
+            df.append(df_.T)
+        print("Concatenating transcriptomes")
+        df = pd.concat(df)
+        print("Concatenated transcriptomes")
+        print(df.head())
+        print("Shape of df:", df.shape)
+        df.to_csv(target_csv, index=True, sep='\t', engine='pyarrow')
+        print("Saved transcriptomes to csv")
+    else:
+        print(f"Using existing aggregated transcriptome file at {target_csv}")
+
+    print("Initializing TranscriptomeDataset")
+    
     dataset = TranscriptomeDataset()
-    dataset.load_transcriptomes()
-    dataset.transcriptomes.to_csv(path / 'all_transcriptomes.csv', index=False)
+    print("Done, now loading transcriptomes into dataset")
+    print(f"Shape of initialized TranscriptomeDataset: {dataset.transcriptomes.shape if hasattr(dataset, 'transcriptomes') and dataset.transcriptomes is not None else 'Not loaded yet'}")
+    print(f"Columns in initialized TranscriptomeDataset: {dataset.transcriptomes.columns if hasattr(dataset, 'transcriptomes') and dataset.transcriptomes is not None else 'Not loaded yet'}")
+    
+    dataset.load_transcriptomes(csv_path=target_csv)
+    print("Loaded transcriptomes into dataset")
+    print(f"Shape of loaded transcriptomes: {dataset.transcriptomes.shape if hasattr(dataset, 'transcriptomes') and dataset.transcriptomes is not None else 'Not loaded yet'}")
+    # print(f"Columns of loaded transcriptomes: {dataset.transcriptomes.columns if hasattr(dataset, 'transcriptomes') and dataset.transcriptomes is not None else 'Not loaded yet'}")
+    
+    dataset.transcriptomes.to_csv(source_dir / 'all_transcriptomes.csv', index=False, engine='pyarrow')
+    print("Saved all_transcriptomes to csv")
+    print("Done")
 
 if __name__ == '__main__':
 
