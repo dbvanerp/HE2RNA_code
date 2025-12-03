@@ -110,7 +110,7 @@ class AggregatedDataset(TensorDataset):
 
         file_list = [
             os.path.join(
-                PATH_TO_TILES, project.replace('-', '_'),
+                PATH_TO_TILES, project,
                 '0.50_mpp', filename
             )
             for project, filename in transcriptome_dataset.metadata[['Project.ID', 'Slide.ID']].values
@@ -180,7 +180,7 @@ class TCGAFolder(Dataset):
         labels, cols, patients, projects = load_labels(transcriptome_dataset)
         file_list = [
             os.path.join(
-                PATH_TO_TILES, project.replace('-', '_'),
+                PATH_TO_TILES, project,
                 '0.50_mpp', filename)
             for project, filename in transcriptome_dataset.metadata[['Project.ID', 'Slide.ID']].values]
         return cls(cols, patients, projects, projectname, file_list, labels)
@@ -213,24 +213,60 @@ class H5Dataset(Dataset):
         labels (list or np.array): the associated gene expression values.
         max_items (int): Maximum number of tiles to use for training.
     """
-    def __init__(self, genes, patients, projects, filename, labels, max_items=8000):
-        self.data = h5py.File(filename, 'r')
-        self.targets = labels
+    def __init__(self, genes, patients, projects, filename, labels, max_items=8000, in_memory=True):
+        self.in_memory = in_memory
         self.max_items = max_items
+        self.targets = labels
         self.genes = genes
         self.patients = patients
         self.projects = projects
-        self.dim = self.data['X'].shape[2]
+        self.filename = filename  # Store filename, not the file object!
+        
+        if self.in_memory:
+            print(f"Loading {filename} into RAM...")
+            with h5py.File(self.filename, 'r') as f:
+                # Slice directly to numpy to avoid keeping h5 references
+                data = f['X'][:, :self.max_items, 3:]
+            
+            # Convert to float32 (4 bytes) to save RAM vs float64
+            data = np.asarray(data, dtype=np.float32)
+            self.data = torch.from_numpy(data).permute(0, 2, 1).contiguous()
+            
+            self.length = self.data.shape[0]
+            self.dim = self.data.shape[1]
+            print(f"Loaded successfully. Shape: {self.data.shape}")
+            
+        else:
+            # Just get metadata here, DO NOT open the file yet
+            with h5py.File(self.filename, 'r') as f:
+                self.length = f['X'].shape[0]
+                self.dim = f['X'].shape[2]
+            self.file_handle = None # Placeholder
 
     def __getitem__(self, index):
+        if self.in_memory:
+            sample = self.data[index]
+        else:
+            # LAZY LOADING: Open file only when needed, per worker
+            if not hasattr(self, 'file_handle') or self.file_handle is None:
+                 self.file_handle = h5py.File(self.filename, 'r')
+            
+            # Read specific chunk
+            data_numpy = self.file_handle['X'][index, :self.max_items, 3:]
+            sample = torch.from_numpy(data_numpy.astype(np.float32)).t()
 
-        sample = torch.Tensor(self.data['X'][index, :self.max_items, 3:]).float().t()
         target = self.targets[index]
-
         return sample, target
 
     def __len__(self):
-        return self.data['X'].shape[0]
+        return self.length
+
+    def __del__(self):
+        if not self.in_memory and hasattr(self, 'data'):
+            try:
+                self.data.close()
+            except Exception:
+                pass
 
 
 def patient_split(dataset, random_state=0):

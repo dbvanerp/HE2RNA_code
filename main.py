@@ -45,7 +45,8 @@ class Experiment(object):
     """
 
     def __init__(self,
-                 configfile='config.ini'):
+                 configfile='config.ini',
+                 null_run=False):
 
         # Read configuration file
         self.config = configparser.ConfigParser()
@@ -86,6 +87,8 @@ class Experiment(object):
             self.p_value = 't_test'
         assert self.p_value in ['empirical', 't_test'], \
             "Unrecognized test, should be 'empirical' or 't_test'"
+
+        self.null_run = null_run
 
     def _read_architecture(self):
         model_params = {}
@@ -147,6 +150,17 @@ class Experiment(object):
         else:
             return optim.Adam(lr=1e-3)
 
+    def _predict_without_training(self, model, eval_set, training_params):
+        batch_size = training_params.get('batch_size', 16)
+        num_workers = training_params.get('num_workers', 0)
+        loader = DataLoader(
+            eval_set,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers)
+        preds, labels = predict(model, loader)
+        return preds, labels
+
     def _build_dataset(self):
 
         assert 'data' in self.config.sections(), \
@@ -191,7 +205,7 @@ class Experiment(object):
             elif dic['path_to_data'].endswith('.h5'):
                 y, genes, patients, projects = load_labels(transcriptome_data)
                 dataset = H5Dataset(
-                    genes, patients, projects, dic['path_to_data'], y)
+                    genes, patients, projects, dic['path_to_data'], y, in_memory=True)
 
         else:
             dataset = TCGAFolder.match_transcriptome_data(
@@ -213,7 +227,7 @@ class Experiment(object):
         model_params = self._read_architecture()
         training_params = self._read_training_params()
         dataset = self._build_dataset()
-        evalset = self._build_dataset()
+        evalset = dataset
         if dataset.dim == 2051:  # Remove tile levels and coordinates
             model_params['input_dim'] = dataset.dim - 3
         else:
@@ -261,6 +275,7 @@ class Experiment(object):
                 model.do.p = model_params['dropout']
 
         else:
+            print("Initializing model without saved model")
             # Initialize bias of the last layer with the average target value on the train set
             try:
                 model_params['bias_init'] = torch.nn.Parameter(
@@ -275,17 +290,20 @@ class Experiment(object):
                             [sample[1].numpy() for sample in train_set], axis=0)
                         ).cuda())
             model = HE2RNA(**model_params)
-        optimizer = self._setup_optimization(model)
-
-        preds, labels = fit(model,
-                            train_set,
-                            valid_set,
-                            valid_projects,
-                            test_set=test_set,
-                            params=training_params,
-                            optimizer=optimizer,
-                            logdir=logdir,
-                            path=self.savedir)
+        if self.null_run:
+            preds, labels = self._predict_without_training(
+                model, test_set, training_params)
+        else:
+            optimizer = self._setup_optimization(model)
+            preds, labels = fit(model,
+                                train_set,
+                                valid_set,
+                                valid_projects,
+                                test_set=test_set,
+                                params=training_params,
+                                optimizer=optimizer,
+                                logdir=logdir,
+                                path=self.savedir)
 
         report = {'gene': list(dataset.genes)}
 
@@ -296,7 +314,8 @@ class Experiment(object):
                 label, pred)
 
         report = pd.DataFrame(report)
-        report.to_csv(os.path.join(self.savedir, 'results_single_split.csv'), index=False)
+        filename = 'results_single_split_null.csv' if self.null_run else 'results_single_split.csv'
+        report.to_csv(os.path.join(self.savedir, filename), index=False)
         return report
 
     def cross_validation(self, n_folds=5, random_state=0, logdir='exp'):
@@ -314,7 +333,7 @@ class Experiment(object):
         model_params = self._read_architecture()
         training_params = self._read_training_params()
         dataset = self._build_dataset()
-        evalset = self._build_dataset()
+        evalset = dataset
         if dataset.dim == 2051:  # Remove tile levels and coordinates
             model_params['input_dim'] = dataset.dim - 3
         else:
@@ -334,10 +353,12 @@ class Experiment(object):
 
         if self.splits is None:
             if 'patience' in training_params.keys():
+                print("No splits file provided, generating splits with patient_kfold(); n_folds = ", n_folds, "; valid_size = 0.1")
                 train_idx, valid_idx, test_idx = patient_kfold(
                     dataset, n_splits=n_folds, valid_size=0.1,
                     random_state=random_state)
             else:
+                print("No patience provided, generating splits with patient_kfold(); n_folds = ", n_folds, "; valid_size = 0 (no validation set!)")
                 train_idx, valid_idx, test_idx = patient_kfold(
                     dataset, n_splits=n_folds, valid_size=0,
                     random_state=random_state)
@@ -364,7 +385,18 @@ class Experiment(object):
         else:
             n_samples = {project: [] for project in dataset.projects}
 
+        # We create empty arrays for the whole dataset
+        # Shape: (Total_Patients, Total_Genes)
+        full_preds = np.zeros((len(dataset), model_params['output_dim']))
+        full_labels = np.zeros((len(dataset), model_params['output_dim']))
+        
+        # We also track which indices we have visited to be 100% sure
+        visited_mask = np.zeros(len(dataset), dtype=bool)
+
         for k in range(n_folds):
+            print(f"Running Fold {k}...")
+            fold_logdir = os.path.join(logdir, f'fold_{k}')
+            os.makedirs(fold_logdir, exist_ok=True)
 
             train_set = Subset(dataset, train_idx[k])
             test_set = Subset(evalset, test_idx[k])
@@ -397,6 +429,7 @@ class Experiment(object):
 
             else:
                 # Initialize bias of the last layer with the average target value on the train set
+                print("Initializing model without saved model")
                 try:
                     model_params['bias_init'] = torch.nn.Parameter(
                         torch.Tensor(
@@ -410,20 +443,29 @@ class Experiment(object):
                                 [sample[1].numpy() for sample in train_set], axis=0)
                         ).cuda())
                 model = HE2RNA(**model_params)
-            optimizer = self._setup_optimization(model)
+            if self.null_run:
+                preds, labels = self._predict_without_training(
+                    model, test_set, training_params)
+            else:
+                optimizer = self._setup_optimization(model)
 
-            # Train model
-            preds, labels = fit(model,
-                                train_set,
-                                valid_set,
-                                valid_projects,
-                                test_set=test_set,
-                                params=training_params,
-                                optimizer=optimizer,
-                                logdir=logdir,
-                                path=os.path.join(
-                                    self.savedir,
-                                    'model_' + str(k)))
+                # Train model
+                preds, labels = fit(model,
+                                    train_set,
+                                    valid_set,
+                                    valid_projects,
+                                    test_set=test_set,
+                                    params=training_params,
+                                    optimizer=optimizer,
+                                    logdir=fold_logdir,
+                                    path=os.path.join(
+                                        self.savedir,
+                                        'model_' + str(k)))
+            
+            current_indices = test_idx[k]
+            full_preds[current_indices] = preds
+            full_labels[current_indices] = labels
+            visited_mask[current_indices] = True
 
             # Compute metrics for each fold
             for project in np.unique(test_projects):
@@ -431,11 +473,50 @@ class Experiment(object):
                 label = labels[test_projects == project]
                 report['correlation_' + project + '_fold_' + str(k)] = compute_metrics(
                     label, pred)
+        
+        pct_visited = visited_mask.mean() * 100
+        print(f"Visited {pct_visited:.2f}% of patients during cross-validation.")
+        
+        # Compute metrics for the whole dataset
+        all_projects = dataset.projects.apply(lambda x: x.replace('_', '-')).values
+        unique_projects = np.unique(all_projects)
+        report_whole_dataset = {'gene': list(dataset.genes)}
+        for project in unique_projects:
+            pred = full_preds[all_projects == project]
+            label = full_labels[all_projects == project]
 
+            # Calculate Standard Deviation of the True Labels
+            label_std = np.std(label, axis=0)
+            
+            # Identify "Degenerate" Genes (Low variance / sparse)
+            # Threshold: 0.01 is usually sufficient to kill the 'binary' artifacts
+            bad_gene_mask = label_std < 0.01
+            
+            # Compute Metric (Vectorized Pearson)
+            # This returns an array of shape (N_genes,)
+            corr = compute_metrics(label, pred)
+            
+            # Apply Filter
+            # Instead of deleting the rows (which breaks the DataFrame structure),
+            # we set them to NaN. The plotting script will ignore NaNs.
+            # corr[bad_gene_mask] = np.nan
+            
+            # Print how many genes with low variance were found
+            n_dropped = np.sum(bad_gene_mask)
+            if n_dropped > 0:
+                print(f"Project {project}: Found {n_dropped} genes with low variance.")
+
+            report_whole_dataset['correlation_' + project] = corr
+
+        
         report = pd.DataFrame(report)
-        report.to_csv(os.path.join(self.savedir, 'results_per_fold.csv'), index=False)
+        report_whole_dataset = pd.DataFrame(report_whole_dataset)
+        filename = 'results_per_fold_null.csv' if self.null_run else 'results_per_fold.csv'
+        filename_whole_dataset = 'results_whole_dataset_null.csv' if self.null_run else 'results_whole_dataset.csv'
+        report.to_csv(os.path.join(self.savedir, filename), index=False)
+        report_whole_dataset.to_csv(os.path.join(self.savedir, filename_whole_dataset), index=False)
 
-        return report
+        return report, report_whole_dataset
 
 
 def main():
@@ -448,25 +529,36 @@ def main():
         "--n_folds", help="number of folds for 'cross_validation'",
         default=5)
     parser.add_argument(
-        "--logdir", help="path to the directory used by TensoboardX",
+        "--logdir", help="path to the directory used by TensorboardX",
         default='./exp')
     parser.add_argument(
         "--rs", help="random state",
         default=0)
+    parser.add_argument(
+        "--output_dir", help="override the output path in the config file",
+        default=None)
+    parser.add_argument(
+        "--null_run", help="skip training and run an untrained/null model",
+        action='store_true')
     args = parser.parse_args()
     print("Using configuration defined in {}".format(args.config))
     for config in args.config.split(','):
-        exp = Experiment(config)
+        exp = Experiment(config, null_run=args.null_run)
+        if args.output_dir:
+            exp.savedir = args.output_dir
+            if not os.path.exists(exp.savedir):
+                os.makedirs(exp.savedir, exist_ok=True)
 
         assert args.run in ['single_run', 'cross_validation'], \
             "Unrecognized experiment, must be either 'single_run' or 'cross_validation"
         if args.run == 'single_run':
             report = exp.single_run(logdir=args.logdir)
         elif args.run == 'cross_validation':
-            report = exp.cross_validation(
+            report, report_whole_dataset = exp.cross_validation(
                 n_folds=int(args.n_folds),
                 random_state=int(args.rs), logdir=args.logdir)
         print(report)
+        print(report_whole_dataset)
 
 
 if __name__ == '__main__':

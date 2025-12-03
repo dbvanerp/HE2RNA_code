@@ -83,7 +83,17 @@ class HE2RNA(nn.Module):
         mask = (mask > 0).float()
         x = self.conv(x) * mask
         t, _ = torch.topk(x, k, dim=2, largest=True, sorted=True)
-        x = torch.sum(t * mask[:, :, :k], dim=2) / torch.sum(mask[:, :, :k], dim=2)
+        
+        # Calculate denominator
+        denom = torch.sum(mask[:, :, :k], dim=2)
+        
+        # Check for zero denominator (empty mask)
+        if (denom == 0).any():
+            print(f"WARNING: Found slide with 0 valid tiles for k={k}. Input shape: {x.shape}")
+            # Add epsilon to avoid NaN
+            # denom = denom + 1e-6
+            
+        x = torch.sum(t * mask[:, :, :k], dim=2) / denom
         return x
 
     def conv(self, x):
@@ -112,17 +122,66 @@ def training_epoch(model, dataloader, optimizer):
     train_loss = np.mean(train_loss)
     return train_loss
 
-def compute_correlations(labels, preds, projects):
+def compute_correlations_old(labels, preds, projects):
     metrics = []
     for project in np.unique(projects):
         for i in range(labels.shape[1]):
             y_true = labels[projects == project, i]
             if len(np.unique(y_true)) > 1:
                 y_prob = preds[projects == project, i]
-                metrics.append(np.corrcoef(y_true, y_prob)[0, 1])
+                # Check for constant prediction which causes NaN correlation
+                if np.std(y_prob) == 0:
+                    print(f"WARNING: Constant prediction detected for project {project}, gene index {i}. Setting correlation to 0.")
+                    metrics.append(0.0)
+                else:
+                    corr = np.corrcoef(y_true, y_prob)[0, 1]
+                    metrics.append(0.0 if np.isnan(corr) else corr)
     metrics = np.asarray(metrics)
-    return np.mean(metrics)
+    return np.nanmean(metrics) if len(metrics) > 0 else 0.0
 
+def compute_correlations(labels, preds, projects):
+    metrics = []
+    unique_projects = np.unique(projects)
+    
+    for project in unique_projects:
+        # Select data for this project
+        mask = (projects == project)
+        p_labels = labels[mask]
+        p_preds = preds[mask]
+        
+        # 1. Calculate Standard Deviations
+        # shape: (n_genes,)
+        labels_std = np.std(p_labels, axis=0)
+        preds_std = np.std(p_preds, axis=0)
+        
+        # 2. Center the data (subtract mean)
+        p_labels_c = p_labels - np.mean(p_labels, axis=0)
+        p_preds_c = p_preds - np.mean(p_preds, axis=0)
+        
+        # 3. Vectorized Correlation Calculation
+        # Numerator: Sum of products
+        numerator = np.sum(p_labels_c * p_preds_c, axis=0)
+        
+        # Denominator: Product of sqrts of sums of squares
+        # We add a tiny epsilon only to avoid crashing on division by zero
+        denominator = np.sqrt(np.sum(p_labels_c**2, axis=0)) * np.sqrt(np.sum(p_preds_c**2, axis=0))
+        
+        # 4. Calculate Corrs (handling division by zero)
+        # If denominator is 0, division gives NaN or Inf
+        with np.errstate(divide='ignore', invalid='ignore'):
+            corrs = numerator / denominator
+        
+        # 5. Enforce the logic from your original code:
+        # Original: "if np.std(y_prob) == 0: metrics.append(0.0)"
+        # We also check labels_std to match np.corrcoef behavior (undefined if target is constant)
+        invalid_mask = (labels_std < 1e-12) | (preds_std < 1e-12) | np.isnan(corrs)
+        
+        # Set invalid correlations to 0.0 (Penalize the model for constant predictions)
+        corrs[invalid_mask] = 0.0
+        
+        metrics.extend(corrs)
+
+    return np.nanmean(metrics) if len(metrics) > 0 else 0.0
 
 def evaluate(model, dataloader, projects):
     """Evaluate the model on the validation set and return loss and metrics.
@@ -203,7 +262,7 @@ def fit(model,
     max_epochs = default_params['max_epochs']
     num_workers = default_params['num_workers']
 
-    writer = SummaryWriter(log_dir=logdir)
+    writer = SummaryWriter(log_dir=logdir, flush_secs=30)
 
     # SET num_workers TO 0 WHEN WORKING WITH hdf5 FILES
     train_loader = DataLoader(

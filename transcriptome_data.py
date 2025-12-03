@@ -45,7 +45,7 @@ class TranscriptomeDataset:
         #         'metadata',
         #         'samples_description.csv'),
         #     sep='\t')
-        transcriptome_metadata = pd.read_csv("/home/dvanerp/pepsi/data/raw/master_tcga_keyfile_with_sample_type.csv", sep=',', engine='pyarrow')
+        transcriptome_metadata = pd.read_csv("/home/dvanerp/pepsi/data/raw/manifests/new_keyfiles/new_master_keyfile.csv", sep=',')
         
         # Instead of inferring Sample.ID and Case.ID from slide_filename like below, I requested the Case.ID and Sample.ID from the GDC API and added them to the metadata file.
    
@@ -63,10 +63,10 @@ class TranscriptomeDataset:
                 project for project in self.projectname]
             self.transcriptome_metadata = transcriptome_metadata.loc[
                 (transcriptome_metadata['Project.ID'].isin(directories))  &
-                (transcriptome_metadata['Sample.Type'] == 'Primary Tumor')]
+                (transcriptome_metadata['Sample.Type'] == 'Primary Tumor')].copy()
         else:
             self.transcriptome_metadata = transcriptome_metadata.loc[
-                transcriptome_metadata['Sample.Type'] == 'Primary Tumor']
+                transcriptome_metadata['Sample.Type'] == 'Primary Tumor'].copy()
 
         self.image_metadata = self._get_infos_on_tiles(self.projectname)
         self._match_data()
@@ -79,7 +79,7 @@ class TranscriptomeDataset:
             usecols = None
         else:
             usecols = list(genes) + ['File.ID', 'Sample.ID', 'Case.ID', 'Project.ID']
-        transcriptomes = pd.read_csv(path, usecols=usecols, engine='pyarrow')
+        transcriptomes = pd.read_csv(path, usecols=usecols)
         if projectname is None:
             projectname = transcriptomes['Project.ID']
         else:
@@ -145,8 +145,7 @@ class TranscriptomeDataset:
             csv_path,
             sep='\t',
             usecols=self.genes,
-            index_col=0,
-            engine='pyarrow')
+            index_col=0)
 
         df['File.ID'] = df.index
         df = df.merge(self.metadata[['File.ID', 'Sample.ID',
@@ -173,7 +172,7 @@ def main():
 
     target_csv = args.input_csv.expanduser().resolve()
     source_dir = Path(PATH_TO_TRANSCRIPTOME)
-
+    print("Final csv path:", source_dir / 'all_transcriptomes_fpkm_uq.csv')
     if args.force_rebuild or not target_csv.exists():
         print(f"Generating aggregated transcriptome file at {target_csv}")
         target_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -184,8 +183,7 @@ def main():
                 f,
                 sep='\t',
                 comment='#',                     # skip the first `# gene-model…` line
-                usecols=['gene_id', 'tpm_unstranded'],
-                engine='pyarrow'
+                usecols=['gene_id', 'fpkm_uq_unstranded']
             )
             df_ = df_.loc[df_['gene_id'].str.startswith('ENSG')].set_index('gene_id')
             df_.columns = [f.parent.name]        # use the File ID folder as the sample name
@@ -195,7 +193,7 @@ def main():
         print("Concatenated transcriptomes")
         print(df.head())
         print("Shape of df:", df.shape)
-        df.to_csv(target_csv, index=True, sep='\t', engine='pyarrow')
+        df.to_csv(target_csv, index=True, sep='\t')
         print("Saved transcriptomes to csv")
     else:
         print(f"Using existing aggregated transcriptome file at {target_csv}")
@@ -212,7 +210,7 @@ def main():
     print(f"Shape of loaded transcriptomes: {dataset.transcriptomes.shape if hasattr(dataset, 'transcriptomes') and dataset.transcriptomes is not None else 'Not loaded yet'}")
     # print(f"Columns of loaded transcriptomes: {dataset.transcriptomes.columns if hasattr(dataset, 'transcriptomes') and dataset.transcriptomes is not None else 'Not loaded yet'}")
     
-    dataset.transcriptomes.to_csv(source_dir / 'all_transcriptomes.csv', index=False, engine='pyarrow')
+    dataset.transcriptomes.to_csv(source_dir / 'all_transcriptomes_fpkm_uq.csv', index=False)
     print("Saved all_transcriptomes to csv")
     print("Done")
 
