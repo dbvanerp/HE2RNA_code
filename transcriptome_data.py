@@ -22,8 +22,6 @@ from pathlib import Path
 from tqdm import tqdm
 from constant import PATH_TO_TILES, PATH_TO_TRANSCRIPTOME
 
-PATH_TO_TILES = "/gpfs/work4/0/prjs1086/pepsi/data/processed/tcga_resnet_feats"
-PATH_TO_TRANSCRIPTOME = "/gpfs/work4/0/prjs1086/pepsi/data/raw/tcga_rna/"
 
 class TranscriptomeDataset:
     """A class for dealing with RNAseq data and matching them with available
@@ -45,7 +43,7 @@ class TranscriptomeDataset:
         #         'metadata',
         #         'samples_description.csv'),
         #     sep='\t')
-        transcriptome_metadata = pd.read_csv("/home/dvanerp/pepsi/data/raw/manifests/new_keyfiles/new_master_keyfile.csv", sep=',')
+        transcriptome_metadata = pd.read_csv("/home/dvanerp/pepsi/data/processed/tcga_rna/keyfile_matched_to_uni_first_column.csv", sep=',')
         
         # Instead of inferring Sample.ID and Case.ID from slide_filename like below, I requested the Case.ID and Sample.ID from the GDC API and added them to the metadata file.
    
@@ -85,6 +83,8 @@ class TranscriptomeDataset:
         else:
             transcriptomes = transcriptomes.loc[transcriptomes['Project.ID'].isin(projectname)]
         genes = [col for col in transcriptomes.columns if col.startswith('ENSG')]
+        print(f"Path to transcriptomes: {path}")
+        print(f"Projectname: {projectname}")
         dataset = cls(projectname, genes)
         transcriptomes.sort_values('Sample.ID', inplace=True)
         transcriptomes.reset_index(inplace=True, drop=True)
@@ -98,8 +98,14 @@ class TranscriptomeDataset:
 
         if subdirs is not None:
             df = []
-            for subdir in tqdm(subdirs, desc="getting metadata per slide feature", mininterval=4, total=len(subdirs)):
-                dir_tiles = os.path.join(PATH_TO_TILES, subdir, zoom)
+            print(f"Number of subdirs: {len(subdirs)}")
+            for subdir in tqdm(subdirs, desc="getting metadata per slide feature", mininterval=4):
+                dir_path = os.path.join(PATH_TO_TILES, subdir)
+                # Check if any direct subdirectory contains zoom level
+                if zoom in os.listdir(dir_path):
+                    dir_tiles = os.path.join(dir_path, zoom)
+                else:
+                    dir_tiles = dir_path
                 filenames = [f for f in os.listdir(dir_tiles) if f.endswith('.npy') and 'mask' not in f]
                 case_ids = [f[:12] for f in filenames]
                 sample_ids = [f[:16] for f in filenames]
@@ -108,7 +114,9 @@ class TranscriptomeDataset:
                 df.append(pd.DataFrame(
                     {'Project.ID': subdir, 'Case.ID': case_ids, 'Sample.ID_image': sample_ids,
                      'ID': full_ids, 'Slide.ID': filenames}))
-            return pd.concat(df)
+            pd_concat = pd.concat(df)
+            print(f"Shape of metadata after concat in _get_infos_on_tiles(): {pd_concat.shape}")
+            return pd_concat
         else:
             print("No projectname filters provided, getting subdirs for all TCGA projects in PATH_TO_TILES")
             subdirs = []
@@ -124,14 +132,41 @@ class TranscriptomeDataset:
             lambda x: x[:-1])
         self.image_metadata['Sample'] = self.image_metadata['Sample.ID_image'].apply(
             lambda x: x[:-1])
+
+        # --- DIAGNOSTIC: Find the 12 missing samples ---
+        transcriptome_samples = set(self.transcriptome_metadata['Sample'].unique())
+        image_samples = set(self.image_metadata['Sample'].unique())
+        
+        # Slides without transcriptome
+        slides_without_rna = image_samples - transcriptome_samples
+        print(f"Slides WITHOUT matching transcriptome ({len(slides_without_rna)}): {slides_without_rna}")
+        
+        # Transcriptomes without slides
+        rna_without_slides = transcriptome_samples - image_samples
+        print(f"Transcriptomes WITHOUT matching slide ({len(rna_without_slides)}): {rna_without_slides}")
+        
+        # Show full details for missing ones
+        if slides_without_rna:
+            missing_slides = self.image_metadata[self.image_metadata['Sample'].isin(slides_without_rna)]
+            print("Missing slide details:")
+            print(missing_slides[['Project.ID', 'Sample', 'Sample.ID_image', 'Slide.ID']].drop_duplicates())
+        
+        if rna_without_slides:
+            missing_rna = self.transcriptome_metadata[self.transcriptome_metadata['Sample'].isin(rna_without_slides)]
+            print("Missing transcriptome details:")
+            print(missing_rna[['Sample.ID', 'Case.ID', 'Sample']].drop_duplicates())
+        # --- END DIAGNOSTIC ---
+        
         self.transcriptome_metadata.drop('Project.ID', axis=1, inplace=True)
         self.metadata = self.transcriptome_metadata.merge(
             self.image_metadata[['Project.ID', 'Sample', 'Sample.ID_image', 'ID', 'Slide.ID']],
             on='Sample')
+        print(f"Shape of metadata after merge and groupby in _match_data(): {self.metadata.groupby('Slide.ID').size().shape}")
         # If several transcriptomes can be associated with a slide, pick only one.
         self.metadata = self.metadata.groupby('Slide.ID').first().reset_index()
         self.metadata.sort_values('Sample.ID', inplace=True)
         self.metadata.reset_index(inplace=True, drop=True)
+        print(f"Shape of metadata after .first() in _match_data(): {self.metadata.shape}")
 
     def load_transcriptomes(self, csv_path=None):
         """Select transcriptomic data of the selected project and genes.
@@ -172,7 +207,7 @@ def main():
 
     target_csv = args.input_csv.expanduser().resolve()
     source_dir = Path(PATH_TO_TRANSCRIPTOME)
-    print("Final csv path:", source_dir / 'all_transcriptomes_fpkm_uq.csv')
+    print("Final csv path:", source_dir / 'all_transcriptomes_uni.csv')
     if args.force_rebuild or not target_csv.exists():
         print(f"Generating aggregated transcriptome file at {target_csv}")
         target_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -183,7 +218,7 @@ def main():
                 f,
                 sep='\t',
                 comment='#',                     # skip the first `# gene-model…` line
-                usecols=['gene_id', 'fpkm_uq_unstranded']
+                usecols=['gene_id', 'tpm_unstranded']
             )
             df_ = df_.loc[df_['gene_id'].str.startswith('ENSG')].set_index('gene_id')
             df_.columns = [f.parent.name]        # use the File ID folder as the sample name
@@ -210,7 +245,7 @@ def main():
     print(f"Shape of loaded transcriptomes: {dataset.transcriptomes.shape if hasattr(dataset, 'transcriptomes') and dataset.transcriptomes is not None else 'Not loaded yet'}")
     # print(f"Columns of loaded transcriptomes: {dataset.transcriptomes.columns if hasattr(dataset, 'transcriptomes') and dataset.transcriptomes is not None else 'Not loaded yet'}")
     
-    dataset.transcriptomes.to_csv(source_dir / 'all_transcriptomes_fpkm_uq.csv', index=False)
+    dataset.transcriptomes.to_csv(source_dir / 'all_transcriptomes_uni.csv', index=False)
     print("Saved all_transcriptomes to csv")
     print("Done")
 

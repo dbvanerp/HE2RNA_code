@@ -28,19 +28,10 @@ from kmeans_pytorch import kmeans
 from wsi_data import TCGAFolder, ToTensor
 from transcriptome_data import TranscriptomeDataset
 import torch
-import uuid
+from utils import summarize_class
+import pandas as pd
 
 def plot_cluster(slide_name, coords, cluster_ids, centroids):
-    # plot
-    def _to_numpy(arr):
-        if isinstance(arr, torch.Tensor):
-            return arr.detach().cpu().numpy()
-        return arr
-
-    coords = _to_numpy(coords)
-    cluster_ids = _to_numpy(cluster_ids)
-    centroids = _to_numpy(centroids)
-
     plt.figure(figsize=(4, 3), dpi=160)
     # Make scatter points smaller by setting s
     plt.scatter(coords[:, 0], coords[:, 1], c=cluster_ids, cmap='cool', s=8)
@@ -63,8 +54,8 @@ def plot_cluster(slide_name, coords, cluster_ids, centroids):
         loc='center'
     )
     plt.tight_layout(rect=[0, 0, 1, 0.93])  # leave a bit more space above the plot for the title
-    plt.savefig(f"/home/dvanerp/temp_clusterplots/cluster_plot_{slide_name}.png")
-    print(f"Saved cluster plot to /home/dvanerp/temp_clusterplots/cluster_plot_{slide_name}.png")
+    plt.savefig(f"/home/dvanerp/temp_clusterplots_uni/cluster_plot_{slide_name}.png")
+    print(f"Saved cluster plot to /home/dvanerp/temp_clusterplots_uni/cluster_plot_{slide_name}.png")
     plt.close()
 
 
@@ -80,28 +71,42 @@ def cluster_dataset(dataset, n_tiles=100,
     """
 
     file = h5py.File(path_to_data, 'w')
-    file.create_dataset('X', (len(dataset), n_tiles, 2051))
+    file.create_dataset('X', (len(dataset), n_tiles, 1539))     # 1539 = 1 + 2 + 1536, UNI2 shape
     file.create_dataset('cluster_attribution', (len(dataset), 8000))
+    # Store slide_name as a fixed-length string dataset, e.g. up to 64 UTF-8 chars per name
+    dt = h5py.string_dtype(encoding='utf-8', length=23)
+    file.create_dataset('slide_name', (len(dataset),), dtype=dt)
 
     dataloader = DataLoader(
         dataset, batch_size=1, shuffle=False, num_workers=16,)
-
+    samples_import = pd.read_csv('/home/dvanerp/uni_matched_slide_filenames.csv', header=None)
     n = 0
-
-
+    # print(os.path.basename(dataset.samples))
+    
     for x, y in tqdm(dataloader):
         # x comes as a tuple from DataLoader; first element is your array
 
         path, _ = dataset.samples[n]
         slide_filename = os.path.basename(path)
         slide_name = os.path.splitext(slide_filename)[0]
-
+        if slide_filename != samples_import.iloc[n][0]:
+            raise ValueError(f"Slide name {slide_name} does not match {samples_import.iloc[n][0]}")
+            
         x = x[0].numpy().T
 
         # Remove padding
-        mask = x[:, 0] > 0
+        # Check if coordinates are valid (non-zero) or if feature embeddings have non-zero values
+        # Since zoom level (col 0) is 0 for all tiles, we can't use it for padding detection
+        # Instead, check if coordinates (cols 1:3) are valid or if features (cols 3:) have any non-zero values
+        has_valid_coords = np.any(x[:, 1:3] != 0, axis=1)  # At least one coordinate is non-zero
+        has_valid_features = np.any(x[:, 3:] != 0, axis=1)  # At least one feature is non-zero
+        mask = has_valid_coords | has_valid_features
         x = x[mask]
-        zoom_value = x[0, 0]
+        
+        if x.shape[0] == 0:
+            raise ValueError(f"No valid tiles found for slide {slide_name} after removing padding")
+        
+        zoom_value = x[0, 0]  # Get zoom value from first valid tile
 
         # Split coordinates and values
         coords = torch.tensor(x[:, 1:3], dtype=torch.float32).cuda()
@@ -134,7 +139,7 @@ def cluster_dataset(dataset, n_tiles=100,
         # Create a new column for the zoom level
         zoom_col = np.full((num_clusters, 1), zoom_value, dtype=np.float32)
 
-        x_clustered = np.concatenate([zoom_col, new_c, new_x], axis=1)  # shape: (num_clusters, 2051)
+        x_clustered = np.concatenate([zoom_col, new_c, new_x], axis=1)  # shape: (num_clusters, 1539)
 
         # Pad if fewer than n_tiles
         num_clusters = x_clustered.shape[0]
@@ -145,21 +150,23 @@ def cluster_dataset(dataset, n_tiles=100,
         # Save to HDF5
         file['X'][n] = x_clustered
 
-        cluster_ids_np = cluster_ids.cpu().numpy()  # Shape is (7997,)
+        cluster_ids_np = cluster_ids.cpu().numpy()  # Shape is (num_valid_tiles,)
 
-        # Get the number of original tiles you're saving
-        num_original_tiles = cluster_ids_np.shape[0]  # This is 7997
+        # Get the number of valid tiles (after removing padding)
+        num_valid_tiles = cluster_ids_np.shape[0]
 
         # Create the destination array with the correct HDF5 shape (8000)
-        # (You used 8000 when you created the dataset, not n_tiles)
+        # The array size is fixed at 8000 to match the input padding from ToTensor
         cluster_attr = np.zeros(8000, dtype=np.int64) 
 
-        # Copy your (7997,) data into the (8000,) array
-        cluster_attr[:num_original_tiles] = cluster_ids_np 
+        # Copy cluster IDs into the first num_valid_tiles positions
+        # Remaining positions stay as zeros (representing padding tiles that were removed)
+        cluster_attr[:num_valid_tiles] = cluster_ids_np 
 
         # Save the full (8000,) array
         file['cluster_attribution'][n] = cluster_attr
-
+        file['slide_name'][n] = slide_name
+        
         n += 1
 
     file.close()
@@ -178,7 +185,9 @@ def main():
     rna_data = TranscriptomeDataset.from_saved_file(args.path_to_transcriptome, genes=[])
     histo_data = TCGAFolder.match_transcriptome_data(rna_data)
     histo_data.transform = ToTensor()
-    
+    summarize_class(histo_data)
+    summarize_class(rna_data)
+    print(rna_data.metadata.head())
     cluster_dataset(histo_data, n_tiles=args.n_tiles, path_to_data=args.path_to_save_processed_data)
 
 

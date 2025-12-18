@@ -53,7 +53,7 @@ def load_and_aggregate_file(file, reduce=True):
     if reduce:
         x = np.mean(x, axis=0)
     else:
-        x = np.concatenate((x, np.zeros((8000 - x.shape[0], 2048)))).transpose(1, 0)
+        x = np.concatenate((x, np.zeros((8000 - x.shape[0], 1536)))).transpose(1, 0) # 1536 = 1 + 2 + 1536, UNI2 shape
     return x
 
 def load_npy_data(file_list, reduce=True):
@@ -94,7 +94,7 @@ class AggregatedDataset(TensorDataset):
         self.genes = genes
         self.patients = patients
         self.projects = projects
-        self.dim = 2048
+        self.dim = 1536 # 1539 = 1 + 2 + *1536*, UNI2 shape
 
     @classmethod
     def match_transcriptome_data(cls, transcriptome_dataset):
@@ -108,13 +108,16 @@ class AggregatedDataset(TensorDataset):
         """
         y, cols, patients, projects = load_labels(transcriptome_dataset)
 
-        file_list = [
-            os.path.join(
-                PATH_TO_TILES, project,
-                '0.50_mpp', filename
-            )
-            for project, filename in transcriptome_dataset.metadata[['Project.ID', 'Slide.ID']].values
-        ]
+        file_list = []
+        for project, filename in transcriptome_dataset.metadata[['Project.ID', 'Slide.ID']].values:
+            project_dir = os.path.join(PATH_TO_TILES, project)
+            mpp_path = os.path.join(project_dir, '0.50_mpp')
+            if os.path.isdir(mpp_path):
+                file_path = os.path.join(mpp_path, filename)
+            else:
+                file_path = os.path.join(project_dir, filename)
+            file_list.append(file_path)
+        
         X = load_npy_data(file_list)
         return cls(cols, patients, projects, torch.Tensor(X), torch.Tensor(y))
 
@@ -130,7 +133,7 @@ class ToTensor(object):
         if x.shape[0] > self.n_tiles:
             x = x[:self.n_tiles]
         elif x.shape[0] < self.n_tiles:
-            x = torch.cat((x, torch.zeros((self.n_tiles - x.shape[0], 2051))))
+            x = torch.cat((x, torch.zeros((self.n_tiles - x.shape[0], 1539)))) # 1539 = 1 + 2 + 1536, UNI2 shape
         return x.t()
 
 
@@ -166,23 +169,29 @@ class TCGAFolder(Dataset):
         self.patients = patients
         self.projects = projects
         self.samples = samples
+        print(f"Number of samples: {len(samples)}")
+        # print(samples)
 
         self.transform = transform
         self.target_transform = target_transform
 
         self.genes = genes
-        self.dim = 2048
+        self.dim = 1536 # 1539 = 1 + 2 + *1536*, UNI2 shape
         self.masks = masks
 
     @classmethod
     def match_transcriptome_data(cls, transcriptome_dataset, binarize=False):
         projectname = transcriptome_dataset.projectname
         labels, cols, patients, projects = load_labels(transcriptome_dataset)
-        file_list = [
-            os.path.join(
-                PATH_TO_TILES, project,
-                '0.50_mpp', filename)
-            for project, filename in transcriptome_dataset.metadata[['Project.ID', 'Slide.ID']].values]
+        file_list = []
+        for project, filename in transcriptome_dataset.metadata[['Project.ID', 'Slide.ID']].values:
+            project_dir = os.path.join(PATH_TO_TILES, project)
+            subdir = os.path.join(project_dir, '0.50_mpp')
+            if os.path.isdir(subdir):
+                file_path = os.path.join(subdir, filename)
+            else:
+                file_path = os.path.join(project_dir, filename)
+            file_list.append(file_path)
         return cls(cols, patients, projects, projectname, file_list, labels)
 
     def __getitem__(self, index):
@@ -227,8 +236,16 @@ class H5Dataset(Dataset):
             with h5py.File(self.filename, 'r') as f:
                 # Slice directly to numpy to avoid keeping h5 references
                 data = f['X'][:, :self.max_items, 3:]
-            
-            # Convert to float32 (4 bytes) to save RAM vs float64
+            print(f"Shape of h5 file data: {data.shape}")
+
+            # These lines convert the 'data' array (read from the HDF5 file) to float32 type for lower memory usage,
+            # then convert it to a PyTorch tensor, and finally permute its dimensions so that the shape becomes (batch, features, tiles).
+            # - np.asarray(data, dtype=np.float32): Ensures the array is float32, reducing RAM usage vs float64.
+            # - torch.from_numpy(...): Converts the numpy array to a PyTorch tensor.
+            # - .permute(0, 2, 1): Changes the tensor's shape from (num_samples, num_tiles, tile_dim) to (num_samples, tile_dim, num_tiles), 
+            #   matching model/data loader expectations for downstream code.
+            # - .contiguous(): Returns a contiguous tensor in memory (often needed after permute for PyTorch compatibility).
+
             data = np.asarray(data, dtype=np.float32)
             self.data = torch.from_numpy(data).permute(0, 2, 1).contiguous()
             
@@ -307,10 +324,12 @@ def match_patient_split(dataset, split):
 def patient_kfold(dataset, n_splits=5, random_state=0, valid_size=0.1):
     """Perform cross-validation with patient split.
     """
+    print("Starting patient_kfold() function...")
     indices = np.arange(len(dataset))
-
+    print(f"Number of indices: {len(indices)}")
     patients_unique = np.unique(dataset.patients)
-
+    print(f"Number of unique patients: {len(patients_unique)}")
+    print(f"Number of patients in dataset: {len(dataset.patients)}")
     skf = KFold(n_splits, shuffle=True, random_state=random_state)
     ind = skf.split(patients_unique)
 

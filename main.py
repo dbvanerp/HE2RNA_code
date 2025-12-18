@@ -23,6 +23,9 @@ import pickle as pkl
 import pandas as pd
 import numpy as np
 import copy as cp
+from time import sleep
+from tqdm import tqdm
+import h5py
 import torch
 from torch import nn
 from torch.utils.data import Subset, DataLoader
@@ -33,7 +36,8 @@ from wsi_data import load_labels, AggregatedDataset, TCGAFolder, \
     H5Dataset, patient_split, match_patient_split, \
     patient_kfold, match_patient_kfold
 from model import HE2RNA, fit, predict
-from utils import compute_metrics
+from utils import compute_metrics, summarize_class, save_patient_splits
+from constant import PATH_TO_TILES
 
 
 class Experiment(object):
@@ -184,13 +188,16 @@ class Experiment(object):
             transcriptome_data = TranscriptomeDataset.from_saved_file(
                 dic['path_to_transcriptome'], projectname=projectname, genes=genes)
         elif 'path_to_transcriptome' in dic.keys():
+            print(f"Loading transcriptome data via TranscriptomeDataset.from_saved_file() from {dic['path_to_transcriptome']} \nNo projects given in config, using all\n Length of gene filter: {None if genes is None else len(genes)}")
             transcriptome_data = TranscriptomeDataset.from_saved_file(
                 dic['path_to_transcriptome'], genes=genes)
         elif 'projectname' in dic.keys():
             projectname = dic['projectname'].split(',')
+            print(f"Loading transcriptome data via TranscriptomeDataset(projectname, genes) from {dic['path_to_transcriptome']} \nProjects given in config: {projectname}\n Length of gene filter: {None if genes is None else len(genes)}")
             transcriptome_data = TranscriptomeDataset(projectname, genes)
             transcriptome_data.load_transcriptomes()
         else:
+            print(f"No projects or path to transcriptome given in config, building from scratch with TranscriptomeDataset(None, genes)\n Length of gene filter: {None if genes is None else len(genes)}")
             transcriptome_data = TranscriptomeDataset(None, genes)
             transcriptome_data.load_transcriptomes()
 
@@ -203,9 +210,80 @@ class Experiment(object):
                     genes, patients, projects,
                     torch.Tensor(X), torch.Tensor(y))
             elif dic['path_to_data'].endswith('.h5'):
+                print("Loading labels of the following transcriptome_data:")
+                summarize_class(transcriptome_data)
+                
                 y, genes, patients, projects = load_labels(transcriptome_data)
+                # for i, patient in tqdm(list(enumerate(patients)), desc='Iterating over patients'):
+                #     gene_expr_raw = transcriptome_data.transcriptomes['ENSG00000000003.15'][i]
+                #     gene_expr_log = np.log10(1 + gene_expr_raw)
+                #     # Only print if log10(1 + gene_expr_raw) from above does not match y[i][0] (rounded to 4 decimals)
+                #     # or if the patient names do not match
+                #     log_eq = round(gene_expr_log, 4) == round(y[i][0], 4)
+                #     patient_eq = str(patient) == str(transcriptome_data.transcriptomes['Case.ID'][i])
+                #     mismatch_count = 0
+                #     if not log_eq or not patient_eq:
+                #         mismatch_count += 1
+                #         print("Shape of y: ", y.shape, "Shape of y[i]: ", y[i].shape)
+                #         print("From after load_labels / transcriptome_data.dataset:")
+                #         print(f"Patient {i}: {patient} / {transcriptome_data.transcriptomes['Case.ID'][i]}")
+                #         print(f"Patient {i} ENSG...3.15 expression: {genes[0]} / y (log): {y[i][0]} / transcriptome raw: {gene_expr_raw} / transcriptome log10(1+x): {gene_expr_log}")
+                    
+                
+                # if mismatch_count == 0:
+                #     print("No mismatches found, indexes of transcriptome data match")
+                # else:
+                #     print(f"Total mismatch count: {mismatch_count}")
+                #     raise ValueError("Mismatch found in transcriptome data. Please check input files and index matching.")
+
+
                 dataset = H5Dataset(
                     genes, patients, projects, dic['path_to_data'], y, in_memory=True)
+                
+                print(f"Shape of dataset.data: {dataset.data.shape}")
+                # Print headers of dataset.data: print shape and sample information in a loop (num_samples, tile_dim, num_tiles)
+                # for idx in range(25):  # print first 3 samples as a header preview
+                #     print(f"Sample {idx}: patient {dataset.patients[idx]}")
+                #     print(f"Sample {idx}: project {dataset.projects[idx]}")
+                #     print(f"Sample {idx}: gene expression from self.targets: {dataset.targets[idx]} from y: {y[idx]}")
+                    # print(idx, dataset.data[idx][:10]) # print first 10 entries of each sample
+
+            # checking loaded transcriptomes and tile features against original file
+            df = pd.read_csv('/home/dvanerp/pepsi/data/processed/tcga_rna/tcga_full_transcriptome_uni_filtered_ensembl_subset_log.csv')
+            
+            with h5py.File(dic['path_to_data'], 'r') as f:
+                og_h5 = f['X'][:, 0, 3:]
+            print("Shape of og_h5: ", og_h5.shape)
+            print(f"Shape of dataset.data: {dataset.data.shape}")
+            print(f"Length of idx: {len(dataset.targets)}")
+            # Check dataset.targets against the dataframe for first (ENSG00000000003.15) and last (ENSG00000288675.1) gene columns
+            for idx in range(len(dataset.targets)):
+                target_first = dataset.targets[idx][0]
+                target_last = dataset.targets[idx][-1]
+                df_first = df.iloc[idx]["ENSG00000000003.15"]
+                df_last = df.iloc[idx]["ENSG00000288675.1"]
+
+                #2048 numpy features of dataset.data at idx tile 0
+                # Ensure data_features is a 2048 np array (matches og_features: (2048,))
+                # dataset.data shape: (num_samples, 2048, 100) -- want all 2048 dims, tile 0
+                
+                data_features = dataset.data[idx][:, 0].cpu().numpy() if hasattr(dataset.data[idx][:, 0], 'cpu') else dataset.data[idx][:, 0].numpy()
+                og_features = og_h5[idx][:]
+                # print("shape of data_features: ", data_features.shape, "shape of og_features: ", og_features.shape)
+                # Compare data_features and og_features for exact match
+                if not np.array_equal(data_features, og_features):
+                    print(f"features mismatch at idx {idx}, patient {dataset.patients[idx]}")
+                    print("mean of data_features: ", np.mean(data_features), "mean of og_features: ", np.mean(og_features))
+
+                
+                # Compare using float tolerance (since these are floats)
+                if not (abs(target_first - df_first) < 1e-4 and abs(target_last - df_last) < 1e-4):
+                    print(f"transcriptome mismatch at idx {idx}, patient {dataset.patients[idx]}: target_first={target_first}, df_first={df_first}, target_last={target_last}, df_last={df_last}")
+            # print("First 5 values of each of the first 16 entries of og_h5:")
+            # print(og_h5[:16, :5])
+            # print("The first and last values of each of the first 16 entries of dataset.targets:")
+            # print(dataset.targets[:16, [0, -1]])
+            print("Completed checking for transcriptome and features mismatches")
 
         else:
             dataset = TCGAFolder.match_transcriptome_data(
@@ -393,13 +471,23 @@ class Experiment(object):
         # We also track which indices we have visited to be 100% sure
         visited_mask = np.zeros(len(dataset), dtype=bool)
 
+        # Collect patient IDs for each fold to save splits
+        train_patients_list = []
+        valid_patients_list = []
+        test_patients_list = []
+
         for k in range(n_folds):
             print(f"Running Fold {k}...")
             fold_logdir = os.path.join(logdir, f'fold_{k}')
             os.makedirs(fold_logdir, exist_ok=True)
 
             train_set = Subset(dataset, train_idx[k])
+            print("Shape of train_idx:", train_idx[k].shape, "first entries:", train_idx[k][:16])
+            summarize_class(train_set)
+            summarize_class(dataset)
             test_set = Subset(evalset, test_idx[k])
+
+
             if len(valid_idx) > 0:
                 valid_set = Subset(evalset, valid_idx[k])
                 valid_projects = dataset.projects[valid_idx[k]]
@@ -411,6 +499,21 @@ class Experiment(object):
 
             test_projects = dataset.projects[test_idx[k]].apply(
                 lambda x: x.replace('_', '-')).values
+
+            # Collect patient IDs for this fold
+            train_patients_fold = dataset.patients[train_idx[k]].values if hasattr(dataset.patients, 'values') else np.array(dataset.patients[train_idx[k]])
+            test_patients_fold = dataset.patients[test_idx[k]].values if hasattr(dataset.patients, 'values') else np.array(dataset.patients[test_idx[k]])
+            
+            train_patients_list.append(train_patients_fold)
+            test_patients_list.append(test_patients_fold)
+            
+            if valid_set is not None:
+                valid_patients_fold = dataset.patients[valid_idx[k]].values if hasattr(dataset.patients, 'values') else np.array(dataset.patients[valid_idx[k]])
+                valid_patients_list.append(valid_patients_fold)
+            else:
+                valid_patients_list.append(np.array([], dtype=object))
+            print(f"Fold {k} patient lengths: {len(train_patients_fold)}, {len(test_patients_fold)}, {len(valid_patients_fold)}")
+
 
             # Initialize the model and define optimizer
             if self.use_saved_model:
@@ -474,6 +577,10 @@ class Experiment(object):
                 report['correlation_' + project + '_fold_' + str(k)] = compute_metrics(
                     label, pred)
         
+        # Save patient splits to pickle file
+        splits_output_path = os.path.join(self.savedir, 'uni_patient_splits_rs0.pkl')
+        save_patient_splits(train_patients_list, valid_patients_list, test_patients_list, splits_output_path)
+
         pct_visited = visited_mask.mean() * 100
         print(f"Visited {pct_visited:.2f}% of patients during cross-validation.")
         

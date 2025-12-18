@@ -111,6 +111,9 @@ def training_epoch(model, dataloader, optimizer):
     loss_fn = nn.MSELoss()
     train_loss = []
     for x, y in tqdm(dataloader):
+        # print("Shape of x: ", x.shape, "Shape of y: ", y.shape)
+        # print("x: ", x[:, :5, 0])
+        # print("y: ", y[:, :5])
         x = x.float().to(model.device)
         y = y.float().to(model.device)
         pred = model(x)
@@ -119,6 +122,7 @@ def training_epoch(model, dataloader, optimizer):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+    # exit()
     train_loss = np.mean(train_loss)
     return train_loss
 
@@ -149,37 +153,50 @@ def compute_correlations(labels, preds, projects):
         p_labels = labels[mask]
         p_preds = preds[mask]
         
-        # 1. Calculate Standard Deviations
-        # shape: (n_genes,)
+        # 1. Calculate Standard Deviations (per gene)
         labels_std = np.std(p_labels, axis=0)
         preds_std = np.std(p_preds, axis=0)
-        
+
+        # Genes with (nearly) constant labels are skipped,
+        # to mirror: "if len(np.unique(y_true)) > 1" in compute_correlations_old
+        varying_labels_mask = labels_std > 1e-12
+        if not np.any(varying_labels_mask):
+            continue
+
+        # Restrict to genes with varying labels
+        p_labels_var = p_labels[:, varying_labels_mask]
+        p_preds_var = p_preds[:, varying_labels_mask]
+        preds_std_var = preds_std[varying_labels_mask]
+
         # 2. Center the data (subtract mean)
-        p_labels_c = p_labels - np.mean(p_labels, axis=0)
-        p_preds_c = p_preds - np.mean(p_preds, axis=0)
-        
+        p_labels_c = p_labels_var - np.mean(p_labels_var, axis=0)
+        p_preds_c = p_preds_var - np.mean(p_preds_var, axis=0)
+
         # 3. Vectorized Correlation Calculation
-        # Numerator: Sum of products
         numerator = np.sum(p_labels_c * p_preds_c, axis=0)
-        
-        # Denominator: Product of sqrts of sums of squares
-        # We add a tiny epsilon only to avoid crashing on division by zero
-        denominator = np.sqrt(np.sum(p_labels_c**2, axis=0)) * np.sqrt(np.sum(p_preds_c**2, axis=0))
-        
-        # 4. Calculate Corrs (handling division by zero)
-        # If denominator is 0, division gives NaN or Inf
+        denominator = (
+            np.sqrt(np.sum(p_labels_c ** 2, axis=0)) *
+            np.sqrt(np.sum(p_preds_c ** 2, axis=0))
+        )
+
         with np.errstate(divide='ignore', invalid='ignore'):
             corrs = numerator / denominator
-        
-        # 5. Enforce the logic from your original code:
-        # Original: "if np.std(y_prob) == 0: metrics.append(0.0)"
-        # We also check labels_std to match np.corrcoef behavior (undefined if target is constant)
-        invalid_mask = (labels_std < 1e-12) | (preds_std < 1e-12) | np.isnan(corrs)
-        
-        # Set invalid correlations to 0.0 (Penalize the model for constant predictions)
-        corrs[invalid_mask] = 0.0
-        
-        metrics.extend(corrs)
+
+        # Split behavior based on prediction variability, matching compute_correlations_old:
+        # - If preds are constant (std ~ 0): append 0.0
+        # - Else: append correlation (NaNs mapped to 0.0)
+        const_pred_mask = preds_std_var < 1e-12
+        var_pred_mask = ~const_pred_mask
+
+        # Constant predictions for varying labels → 0.0
+        if np.any(const_pred_mask):
+            metrics.extend([0.0] * int(np.sum(const_pred_mask)))
+
+        # Non-constant predictions → use correlation, with NaNs mapped to 0.0
+        if np.any(var_pred_mask):
+            valid_corrs = corrs[var_pred_mask]
+            valid_corrs = np.where(np.isnan(valid_corrs), 0.0, valid_corrs)
+            metrics.extend(valid_corrs.tolist())
 
     return np.nanmean(metrics) if len(metrics) > 0 else 0.0
 
