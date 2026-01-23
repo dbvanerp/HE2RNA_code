@@ -42,6 +42,8 @@ class CSCCDataset(Dataset):
         log_transform: bool = True,
         project_column: str = 'metastasis'
     ):
+        print(f"\n{'-'*15} Initializing CSCCDataset {'-'*15}\n")
+        
         self.features_dir = Path(features_dir)
         self.max_tiles = max_tiles
         self.log_transform = log_transform
@@ -63,8 +65,9 @@ class CSCCDataset(Dataset):
         if genes is None:
             # Auto-detect gene columns (adjust pattern as needed)
             self.genes = [c for c in self.targets_df.columns if c not in ['ID', 'study_number']]
+            print(f"No gene filter provided. Auto-detected {len(self.genes)} genes")
         else:
-            self.genes = genes
+            self.genes = self._filter_genes_by_list(genes)
         
         # Build aligned target matrix
         self.targets = self._build_target_matrix()
@@ -74,10 +77,13 @@ class CSCCDataset(Dataset):
         
         self.metadata = self._load_metadata(keyfile_path)
 
-        print(f"CSCCDataset initialized: {len(self)} patients, {len(self.genes)} genes, {self.feature_dim}D features")
+        print(f"\n{'-'*15} CSCCDataset initialized: {len(self)} patients, {len(self.genes)} genes, {self.feature_dim}D features {'-'*15}\n")
+        print(f"Full summary of the dataset:")
+        summarize_class(self)
     
     def _load_keyfile(self, keyfile_path: str) -> dict:
         """Load keyfile and filter by QC status."""
+        print(f"\nFiltering patients by QC status")
         keyfile = pd.read_csv(keyfile_path)
         
         if 'rna_qc_status' in keyfile.columns:
@@ -86,20 +92,21 @@ class CSCCDataset(Dataset):
             # Handle potential NaN values by converting to string first
             keyfile = keyfile[keyfile['rna_qc_status'].astype(str).str.lower().str.strip() != 'fail']
             filtered_count = len(keyfile)
-            print(f"Filtered out {initial_count - filtered_count} patients due to QC failure. Remaining: {filtered_count}")
+            print(f"  Filtered out {initial_count - filtered_count} patients due to QC failure. Remaining: {filtered_count}")
         else:
-            print("Warning: 'rna_qc_status' column not found in keyfile. Skipping QC filtering.")
+            print("  Warning: 'rna_qc_status' column not found in keyfile. Skipping QC filtering.")
             
         return dict(zip(keyfile['skylinedx_id_rsm2'], keyfile['study_number']))
 
     def _index_features(self) -> dict:
         """Map study_number -> h5 file path."""
+        print(f"\nIndexing features from {self.features_dir}")
         feature_files = {}
         for f in os.listdir(self.features_dir):
             if f.endswith('.h5'):
                 study_number = os.path.splitext(f)[0]
                 feature_files[study_number] = self.features_dir / f
-        print(f"Found {len(feature_files)} H5 feature files")
+        print(f"  Found {len(feature_files)} H5 feature files")
         return feature_files
 
     def _load_targets(self, targets_csv: str):
@@ -107,6 +114,7 @@ class CSCCDataset(Dataset):
         Load and transpose targets CSV so that columns are genes and rows are patients (samples),
         then map IDs to study_numbers.
         """
+        print(f"\nLoading targets from {os.path.basename(targets_csv)}\nMight take a while...")
         df = pd.read_csv(targets_csv, index_col=0)  # Expect first col to be IDs, rows are samples, columns are genes
         # If columns are IDs and rows are genes, need to transpose so rows are IDs.
         if 'ID' not in df.columns:
@@ -132,13 +140,13 @@ class CSCCDataset(Dataset):
                 missing_ids.append(sid)
         
         if missing_ids:
-            print(f"Warning: {len(missing_ids)} IDs from targets CSV not found in keyfile (or filtered by QC).")
-            print(f"  First 5 missing: {missing_ids[:5]}...")
+            print(f"  Warning: {len(missing_ids)} IDs from targets CSV not found in keyfile (or filtered by QC).")
+            print(f"    First 5 missing: {missing_ids[:5]}...")
         
         df = df.iloc[valid_rows].reset_index(drop=True)
         df['study_number'] = study_numbers
 
-        print(f"Loaded {len(df)} targets with valid study_numbers after transpose fix")
+        print(f"  Loaded {len(df)} targets with valid study_numbers after transpose fix")
         return df, study_numbers
 
     def _load_features(self, study_number: str) -> torch.Tensor:
@@ -177,6 +185,7 @@ class CSCCDataset(Dataset):
     
     def _align_patients(self) -> List[str]:
         """Find patients with both features and targets."""
+        print(f"\nAligning features and targets")
         has_features = set(self.feature_files.keys())
         has_targets = set(self.target_study_numbers)
 
@@ -185,19 +194,70 @@ class CSCCDataset(Dataset):
         missing_targets = has_features - has_targets
         
         if missing_features:
-            print(f"Warning: {len(missing_features)} patients have targets but no features")
-            print(f"  Missing feature examples: {list(missing_features)[:5]}...")
+            print(f"  Warning: {len(missing_features)} patients have targets but no features")
+            print(f"    Missing feature examples: {list(missing_features)[:5]}...")
                 
         if missing_targets:
-            print(f"Warning: {len(missing_targets)} patients have features but no targets")
-            print(f"  Missing target examples: {list(missing_targets)[:10]}...")
+            print(f"  Warning: {len(missing_targets)} patients have features but no targets")
+            print(f"    Missing target examples: {list(missing_targets)[:10]}...")
         # Return in consistent order (sorted for reproducibility)
         study_numbers = sorted(list(valid))
-        print(f"Aligned {len(study_numbers)} patients with both features and targets")
+        if len(study_numbers) == 0:
+            raise ValueError("No feature samples found with targets after filtering")
+        else:
+            print(f"  Aligned {len(study_numbers)} patients with both features and targets")
         return study_numbers
+    
+    def _filter_genes_by_list(self, genes: List[str]) -> List[str]:
+        """
+        Filter gene columns in targets_csv to match provided gene list.
+        
+        Handles version numbers by splitting on '.' and comparing base IDs.
+        For example, ENSG00000000003.15 will match ENSG00000000003.
+        
+        Args:
+            genes: List of gene identifiers (with or without version numbers)
+            
+        Returns:
+            List of matching column names from targets_csv
+        """
+        print(f"\nFiltering genes")
+        # Get available gene columns (exclude ID and study_number)
+        available_columns = [c for c in self.targets_df.columns if c not in ['ID', 'study_number']]
+        
+        # Create a set of provided genes (normalized: split on '.' to remove version)
+        provided_genes_set = set()
+        for gene in genes:
+            # Handle both string gene names and potential version numbers
+            base_gene = str(gene).split('.')[0]
+            provided_genes_set.add(base_gene)
+        print(f"  Attempting to match {len(provided_genes_set)} provided genes to {len(available_columns)} gene columns in targets_csv")
+        
+        # Match columns: check if column name (without version) matches any provided gene
+        matched_genes = []
+        for col in available_columns:
+            base_col = str(col).split('.')[0]
+            if base_col in provided_genes_set:
+                matched_genes.append(col)
+        
+        # Report matching results
+        if len(matched_genes) == 0:
+            print(f"  Warning: No genes from provided list matched columns in targets_csv")
+            print(f"    Provided genes (first 5): {list(genes)[:5]}")
+            print(f"    Available columns (first 5): {available_columns[:5]}")
+        else:
+            print(f"  Matched {len(matched_genes)} out of {len(genes)} provided genes to columns in targets_csv")
+            if len(matched_genes) < len(genes):
+                # Find unmatched genes by comparing base names
+                matched_base_names = {str(col).split('.')[0] for col in matched_genes}
+                unmatched = [g for g in genes if str(g).split('.')[0] not in matched_base_names]
+                print(f"    {len(unmatched)} genes not found in targets_csv (first 5): {unmatched[:5]}")
+        
+        return matched_genes
     
     def _build_target_matrix(self) -> np.ndarray:
         """Build (n_patients, n_genes) target matrix aligned to study_numbers."""
+        print(f"\nBuilding target matrix")
         # Index targets_df by study_number for fast lookup
         self.targets_df = self.targets_df.set_index('study_number')
         
@@ -541,13 +601,23 @@ if __name__ == "__main__":
     features_dir = "/gpfs/work4/0/prjs1086/derm_shared/cscc/processed/he_packed_patch_feat_uni/rsm2/h5_files"
     targets_csv = "/gpfs/work4/0/prjs1086/derm_shared/cscc/processed/rna_counts/txi.gene.counts.csv"
     keyfile_path = "/gpfs/work4/0/prjs1086/derm_shared/cscc/doc/keyfiles/20260113_project_keyfile_anonymized_rsm2.csv"
-    
+    genes = "/home/dvanerp/pepsi/data/processed/cscc_rna/bailey_dvp_signature_annotated.csv"
+
+
+    if os.path.exists(genes):
+        genes = pd.read_csv(genes)
+        genes = genes['gene'].tolist() if 'gene' in genes.columns else genes.iloc[:,0].tolist()
+    else:
+        genes = genes.split(',')
+    for gene in genes:
+        print(gene)
+        assert gene.startswith('ENSG'), "Unknown gene format"
     dataset = CSCCDataset(
         features_dir=features_dir,
         targets_csv=targets_csv,
         keyfile_path=keyfile_path,
         max_tiles=8000,
-        genes=["ENSG00000000003.15"]
+        genes=genes
     )
     
     train_idx, valid_idx, test_idx = dataset.stratified_kfold()
