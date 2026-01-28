@@ -43,17 +43,11 @@ class TranscriptomeDataset:
         #         'metadata',
         #         'samples_description.csv'),
         #     sep='\t')
-        transcriptome_metadata = pd.read_csv("/home/dvanerp/pepsi/data/processed/tcga_rna/keyfile_matched_to_uni_first_column.csv", sep=',')
+        # keyfile = "/home/dvanerp/pepsi/data/processed/tcga_rna/keyfile_matched_to_uni_first_column.csv"
+        keyfile = "/home/dvanerp/pepsi/data/raw/manifests/new_keyfiles/new_master_keyfile.csv"
+        transcriptome_metadata = pd.read_csv(keyfile, sep=',')
+        print(f"Metadata keyfile used: {keyfile}")
         
-        # Instead of inferring Sample.ID and Case.ID from slide_filename like below, I requested the Case.ID and Sample.ID from the GDC API and added them to the metadata file.
-   
-        # transcriptome_metadata['Sample.ID'] = transcriptome_metadata['slide_filename'].apply(lambda x: x[:16])
-
-        # # Set 'Case.ID' based on 'File.Name':
-        # transcriptome_metadata['Case.ID'] = transcriptome_metadata['slide_filename'].apply(lambda x: x[:12])
-
-        # # For now, this sets all as 'Primary Tumor':
-        # transcriptome_metadata['Sample.Type'] = 'Primary Tumor'
         
         # Select primary tumor samples from the chosen project
         if self.projectname is not None:
@@ -161,7 +155,7 @@ class TranscriptomeDataset:
         self.metadata = self.transcriptome_metadata.merge(
             self.image_metadata[['Project.ID', 'Sample', 'Sample.ID_image', 'ID', 'Slide.ID']],
             on='Sample')
-        print(f"Shape of metadata after merge and groupby in _match_data(): {self.metadata.groupby('Slide.ID').size().shape}")
+        print(f"Shape of metadata after merge and groupby in TranscriptomeDataset._match_data(): {self.metadata.groupby('Slide.ID').size().shape}")
         # If several transcriptomes can be associated with a slide, pick only one.
         self.metadata = self.metadata.groupby('Slide.ID').first().reset_index()
         self.metadata.sort_values('Sample.ID', inplace=True)
@@ -207,7 +201,8 @@ def main():
 
     target_csv = args.input_csv.expanduser().resolve()
     source_dir = Path(PATH_TO_TRANSCRIPTOME)
-    print("Final csv path:", source_dir / 'all_transcriptomes_uni.csv')
+    output_csv = source_dir / 'all_transcriptomes_uni.csv'
+    print("Final csv path:", output_csv)
     if args.force_rebuild or not target_csv.exists():
         print(f"Generating aggregated transcriptome file at {target_csv}")
         target_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -245,7 +240,7 @@ def main():
     print(f"Shape of loaded transcriptomes: {dataset.transcriptomes.shape if hasattr(dataset, 'transcriptomes') and dataset.transcriptomes is not None else 'Not loaded yet'}")
     # print(f"Columns of loaded transcriptomes: {dataset.transcriptomes.columns if hasattr(dataset, 'transcriptomes') and dataset.transcriptomes is not None else 'Not loaded yet'}")
     
-    dataset.transcriptomes.to_csv(source_dir / 'all_transcriptomes_uni.csv', index=False)
+    dataset.transcriptomes.to_csv(output_csv, index=False)
     print("Saved all_transcriptomes to csv")
     print("Done")
 

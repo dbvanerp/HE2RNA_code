@@ -31,10 +31,12 @@ from torch import nn
 from torch.utils.data import Subset, DataLoader
 from torch import optim
 from sklearn.metrics import roc_auc_score
-from transcriptome_data import TranscriptomeDataset
-from wsi_data import load_labels, AggregatedDataset, TCGAFolder, \
-    H5Dataset, patient_split, match_patient_split, \
-    patient_kfold, match_patient_kfold
+# from transcriptome_data import TranscriptomeDataset
+# from wsi_data import load_labels, AggregatedDataset, TCGAFolder, \
+#     H5Dataset, patient_split, match_patient_split, \
+#     patient_kfold, match_patient_kfold
+from CSCCDatasetClass import CSCCDataset
+from TCGADatasetClass import TCGADataset, match_patient_kfold, match_patient_single
 from model import HE2RNA, fit, predict
 from utils import compute_metrics, summarize_class, save_patient_splits
 from constant import PATH_TO_TILES
@@ -68,6 +70,9 @@ class Experiment(object):
 
         if 'use_saved_model' in self.config['main'].keys():
             self.use_saved_model = self.config['main']['use_saved_model']
+            model_num = os.path.basename(self.use_saved_model.rstrip('/')).split('_')[-1] 
+            self.fold = int(model_num) if model_num.isdigit() else None
+            print(f"Using saved model from {self.use_saved_model} with fold {self.fold}")
         else:
             self.use_saved_model = False
 
@@ -84,6 +89,15 @@ class Experiment(object):
             self.subsample = float(self.config['main']['subsample'])
         else:
             self.subsample = None
+
+        # Data mode: 'tcga' (default) or 'cscc'
+        if 'data_mode' in self.config['main'].keys():
+            self.data_mode = self.config['main']['data_mode'].lower()
+        elif 'cscc_mode' in self.config['main'].keys() and self.config['main']['cscc_mode'] == 'True':
+            # Backwards compatibility with old cscc_mode config
+            self.data_mode = 'cscc'
+        else:
+            self.data_mode = 'tcga'
 
         if 'p_value' in self.config['main'].keys():
             self.p_value = self.config['main']['p_value']
@@ -174,15 +188,65 @@ class Experiment(object):
         if 'genes' in dic.keys():
             genes = dic['genes']
             if os.path.exists(genes):
-                genes = pkl.load(
-                    open(genes, 'rb'))
+                if genes.endswith('.pkl'):
+                    genes = pkl.load(open(genes, 'rb'))
+                elif genes.endswith('.csv'):
+                    genes = pd.read_csv(genes)
+                    genes = genes['gene'].tolist() if 'gene' in genes.columns else genes.iloc[:,0].tolist()
+                else:
+                    raise ValueError(f"Unknown gene file format: {genes}\n Only .pkl and .csv files are supported")
             else:
                 genes = genes.split(',')
-                for gene in genes:
-                    assert gene.startswith('ENSG'), "Unknown gene format"
+            for gene in genes:
+                assert gene.startswith('ENSG'), "Unknown gene format"
         else:
             genes = None
 
+        # CSCC mode: load full dataset using CSCCDataset class
+        if self.data_mode == 'cscc':
+            dataset = CSCCDataset(dic['path_to_data'], dic['path_to_transcriptome'], dic['keyfile_path'], genes, project_column=dic['project_column'])
+            print(f"Data mode: CSCC. Loading from {os.path.basename(dic['path_to_data'])}, {os.path.basename(dic['path_to_transcriptome'])}, {os.path.basename(dic['keyfile_path'])}")
+            summarize_class(dataset)
+            return dataset 
+
+        elif self.data_mode == 'tcga':
+            path_to_data = dic['path_to_data']
+
+            # Convert project_filter from comma-separated string to list, if present
+            project_filter = dic['project_filter'] if 'project_filter' in dic.keys() else None
+            if project_filter is not None:
+                project_filter = [p.strip() for p in project_filter.split(",") if p.strip()]
+            
+            if os.path.isdir(path_to_data):
+                print(f"Loading TCGA dataset from features directory: {path_to_data}\nMax tiles = 8000")
+                features_dir = path_to_data
+                dataset = TCGADataset(
+                    targets_csv=dic['path_to_transcriptome'],
+                    keyfile_path=dic['keyfile_path'],
+                    features_dir=features_dir,
+                    genes=genes,
+                    project_filter=project_filter,
+                    max_tiles=8000
+                )
+            elif path_to_data.endswith('.h5'):
+                print(f"Loading TCGA dataset from aggregated H5 file: {path_to_data}\nMax tiles = 100")
+                features_aggregated = path_to_data
+                dataset = TCGADataset(
+                    targets_csv=dic['path_to_transcriptome'],
+                    keyfile_path=dic['keyfile_path'],
+                    features_aggregated=features_aggregated,
+                    genes=genes,
+                    project_filter=project_filter,
+                    max_tiles = 100
+                )
+            else:
+                raise ValueError(f"Unsupported path_to_data format for TCGA: {path_to_data}")
+            print(f"Data mode: TCGA. Loaded from {os.path.basename(dic['path_to_data'])}, {os.path.basename(dic['path_to_transcriptome'])}, {os.path.basename(dic['keyfile_path'])}")
+            
+            return dataset
+
+        print("WARNING: IF THIS PRINTS, YOU ARE BACK TO WSI_DATA AND TRANSCRIPTOME_DATA INSTEAD OF THE BEAUTIFUL SHINY NEW TCGADataset/CSCCDataset")    
+        
         if 'path_to_transcriptome' in dic.keys() and 'projectname' in dic.keys():
             projectname = dic['projectname'].split(',')
             transcriptome_data = TranscriptomeDataset.from_saved_file(
@@ -237,8 +301,8 @@ class Experiment(object):
                 #     raise ValueError("Mismatch found in transcriptome data. Please check input files and index matching.")
 
 
-                dataset = H5Dataset(
-                    genes, patients, projects, dic['path_to_data'], y, in_memory=True)
+                dataset = H5Dataset.match_transcriptome_data(
+                    transcriptome_data, dic['path_to_data'], in_memory=True)
                 
                 print(f"Shape of dataset.data: {dataset.data.shape}")
                 # Print headers of dataset.data: print shape and sample information in a loop (num_samples, tile_dim, num_tiles)
@@ -252,37 +316,48 @@ class Experiment(object):
             df = pd.read_csv('/home/dvanerp/pepsi/data/processed/tcga_rna/tcga_full_transcriptome_uni_filtered_ensembl_subset_log.csv')
             
             with h5py.File(dic['path_to_data'], 'r') as f:
-                og_h5 = f['X'][:, 0, 3:]
-            print("Shape of og_h5: ", og_h5.shape)
+                if dataset.indices is not None:
+                    # h5py requires indices to be in increasing order
+                    sort_idx = np.argsort(dataset.indices)
+                    rev_idx = np.argsort(sort_idx)
+                    og_h5 = f['X'][dataset.indices[sort_idx], 0, 3:]
+                    # Restore original metadata order
+                    og_h5 = og_h5[rev_idx]
+                    
+                    # Also filter the check-dataframe to match
+                    df = df.iloc[dataset.indices].reset_index(drop=True)
+                else:
+                    og_h5 = f['X'][:, 0, 3:]
+            
+            print("Shape of og_h5 for checking: ", og_h5.shape)
             print(f"Shape of dataset.data: {dataset.data.shape}")
-            print(f"Length of idx: {len(dataset.targets)}")
+            print(f"Length of targets: {len(dataset.targets)}")
+            
             # Check dataset.targets against the dataframe for first (ENSG00000000003.15) and last (ENSG00000288675.1) gene columns
+            mismatch_found = False
             for idx in range(len(dataset.targets)):
                 target_first = dataset.targets[idx][0]
                 target_last = dataset.targets[idx][-1]
                 df_first = df.iloc[idx]["ENSG00000000003.15"]
                 df_last = df.iloc[idx]["ENSG00000288675.1"]
 
-                #2048 numpy features of dataset.data at idx tile 0
-                # Ensure data_features is a 2048 np array (matches og_features: (2048,))
-                # dataset.data shape: (num_samples, 2048, 100) -- want all 2048 dims, tile 0
-                
+                # 2048 numpy features of dataset.data at idx tile 0
                 data_features = dataset.data[idx][:, 0].cpu().numpy() if hasattr(dataset.data[idx][:, 0], 'cpu') else dataset.data[idx][:, 0].numpy()
                 og_features = og_h5[idx][:]
-                # print("shape of data_features: ", data_features.shape, "shape of og_features: ", og_features.shape)
+                
                 # Compare data_features and og_features for exact match
                 if not np.array_equal(data_features, og_features):
                     print(f"features mismatch at idx {idx}, patient {dataset.patients[idx]}")
                     print("mean of data_features: ", np.mean(data_features), "mean of og_features: ", np.mean(og_features))
+                    mismatch_found = True
 
-                
-                # Compare using float tolerance (since these are floats)
+                # Compare using float tolerance
                 if not (abs(target_first - df_first) < 1e-4 and abs(target_last - df_last) < 1e-4):
                     print(f"transcriptome mismatch at idx {idx}, patient {dataset.patients[idx]}: target_first={target_first}, df_first={df_first}, target_last={target_last}, df_last={df_last}")
-            # print("First 5 values of each of the first 16 entries of og_h5:")
-            # print(og_h5[:16, :5])
-            # print("The first and last values of each of the first 16 entries of dataset.targets:")
-            # print(dataset.targets[:16, [0, -1]])
+                    mismatch_found = True
+            
+            if not mismatch_found:
+                print("Successfully verified transcriptome and features match for all samples in dataset")
             print("Completed checking for transcriptome and features mismatches")
 
         else:
@@ -306,32 +381,48 @@ class Experiment(object):
         training_params = self._read_training_params()
         dataset = self._build_dataset()
         evalset = dataset
-        if dataset.dim == 2051:  # Remove tile levels and coordinates
-            model_params['input_dim'] = dataset.dim - 3
-        else:
-            model_params['input_dim'] = dataset.dim
+        print(f"Single run dataset after _build_dataset():")
+        summarize_class(dataset)
+        model_params['input_dim'] = dataset.dim
         model_params['output_dim'] = len(dataset.genes)
 
-        if self.split is None:
-            train_idx, valid_idx, test_idx = patient_split(dataset, random_state)
-        else:
+        if self.splits is None:
+            # generating splits from scratch
+            if self.data_mode == 'cscc':
+                # Use stratified splitting with pair protection for CSCC
+                train_idx, valid_idx, test_idx = dataset.stratified_split(
+                    test_size=0.1, valid_size=0.1, random_state=random_state)
+            elif self.data_mode == 'tcga':
+                train_idx, valid_idx, test_idx = dataset.stratified_split(
+                    test_size=0.1, valid_size=0.1, random_state=random_state)
+            else:
+                train_idx, valid_idx, test_idx = patient_split(dataset, random_state)
+        elif self.splits is not None and self.fold is not None:
+            # crossval to single run configuration
+            self.split = [self.splits[0][self.fold], self.splits[1][self.fold], self.splits[2][self.fold]]
+            train_idx, valid_idx, test_idx = match_patient_single(dataset, self.split)
+        elif self.split is not None:
+            # single run to single run configuration
             train_idx, valid_idx, test_idx = match_patient_split(dataset, self.split)
+        else:
+            raise ValueError("Unrecognized split configuration")
 
         train_set = Subset(dataset, train_idx)
         valid_set = Subset(evalset, valid_idx)
         test_set = Subset(evalset, test_idx)
-
-        dic = {}
-        for project in dataset.projects.unique():
-            if project in ['TCGA-LUAD', 'TCGA-LUSC', 'TCGA_LUAD', 'TCGA_LUSC']:
-                dic[project] = 'TCGA-LUNG'
-            elif project in ['TCGA-KICH', 'TCGA-KIRC', 'TCGA-KIRP', 'TCGA_KICH', 'TCGA_KIRC', 'TCGA_KIRP']:
-                dic[project] = 'TCGA-KIDN'
-            elif project in ['TCGA-UCS', 'TCGA-UCEC']:
-                dic[project] = 'TCGA-UTER'
-            else:
-                dic[project] = project
-        dataset.projects = dataset.projects.map(dic)
+        
+        if self.data_mode == 'tcga':
+            dic = {}
+            for project in dataset.projects.unique():
+                if project in ['TCGA-LUAD', 'TCGA-LUSC', 'TCGA_LUAD', 'TCGA_LUSC']:
+                    dic[project] = 'TCGA-LUNG'
+                elif project in ['TCGA-KICH', 'TCGA-KIRC', 'TCGA-KIRP', 'TCGA_KICH', 'TCGA_KIRC', 'TCGA_KIRP']:
+                    dic[project] = 'TCGA-KIDN'
+                elif project in ['TCGA-UCS', 'TCGA-UCEC']:
+                    dic[project] = 'TCGA-UTER'
+                else:
+                    dic[project] = project
+            dataset.projects = dataset.projects.map(dic)
 
         valid_projects = dataset.projects[valid_idx]
         valid_projects = valid_projects.astype(
@@ -340,6 +431,7 @@ class Experiment(object):
             lambda x: x.replace('_', '-')).values
 
         if self.use_saved_model:
+            
             model = torch.load(os.path.join(
                                self.use_saved_model,
                                'model.pt'))
@@ -371,6 +463,7 @@ class Experiment(object):
         if self.null_run:
             preds, labels = self._predict_without_training(
                 model, test_set, training_params)
+            torch.save(model, os.path.join(self.savedir, 'model_null.pt'))
         else:
             optimizer = self._setup_optimization(model)
             preds, labels = fit(model,
@@ -412,10 +505,7 @@ class Experiment(object):
         training_params = self._read_training_params()
         dataset = self._build_dataset()
         evalset = dataset
-        if dataset.dim == 2051:  # Remove tile levels and coordinates
-            model_params['input_dim'] = dataset.dim - 3
-        else:
-            model_params['input_dim'] = dataset.dim
+        model_params['input_dim'] = dataset.dim
         model_params['output_dim'] = len(dataset.genes)
 
         if self.subsample is not None:
@@ -430,32 +520,44 @@ class Experiment(object):
             dataset.projects = projects
 
         if self.splits is None:
-            if 'patience' in training_params.keys():
-                print("No splits file provided, generating splits with patient_kfold(); n_folds = ", n_folds, "; valid_size = 0.1")
-                train_idx, valid_idx, test_idx = patient_kfold(
-                    dataset, n_splits=n_folds, valid_size=0.1,
-                    random_state=random_state)
+            print(f"No splits file provided")
+            valid_size = 0.1 if 'patience' in training_params.keys() else 0
+            if valid_size == 0:
+                print(f"No patience provided, so no early stopping will be performed. Valid_size = {valid_size} (no validation set)")
+            
+            # stratified_kfold function is different depending on the data mode thus the TCGA/CSCC Dataset class. 
+            # this is because the pairing and stratification is vastly different for the two datasets
+            if self.data_mode == 'cscc':
+                # Use stratified k-fold with pair protection for CSCC
+                print(f"CSCC mode: generating splits with stratified_kfold(); n_folds = {n_folds}")
+                train_idx, valid_idx, test_idx = dataset.stratified_kfold(
+                    n_splits=n_folds, valid_size=valid_size, random_state=random_state)
+            elif self.data_mode == 'tcga':
+                print(f"TCGA mode: generating splits with stratified_kfold(); n_folds = {n_folds}")
+                train_idx, valid_idx, test_idx = dataset.stratified_kfold(
+                    n_splits=n_folds, valid_size=valid_size, random_state=random_state)
             else:
-                print("No patience provided, generating splits with patient_kfold(); n_folds = ", n_folds, "; valid_size = 0 (no validation set!)")
-                train_idx, valid_idx, test_idx = patient_kfold(
-                    dataset, n_splits=n_folds, valid_size=0,
-                    random_state=random_state)
+                raise ValueError(f"Invalid data mode: {self.data_mode}")
         else:
+            # match_patient_kfold for now is defined only in the TCGA Dataset class.
+            print(f"Using provided splits file")
             train_patients, valid_patients, test_patients = self.splits
             splits = zip(train_patients, valid_patients, test_patients)
             train_idx, valid_idx, test_idx = match_patient_kfold(dataset, splits)
 
-        dic = {}
-        for project in dataset.projects.unique():
-            if project in ['TCGA-LUAD', 'TCGA-LUSC', 'TCGA_LUAD', 'TCGA_LUSC']:
-                dic[project] = 'TCGA-LUNG'
-            elif project in ['TCGA-KICH', 'TCGA-KIRC', 'TCGA-KIRP', 'TCGA_KICH', 'TCGA_KIRC', 'TCGA_KIRP']:
-                dic[project] = 'TCGA-KIDN'
-            elif project in ['TCGA-UCS', 'TCGA-UCEC']:
-                dic[project] = 'TCGA-UTER'
-            else:
-                dic[project] = project
-        dataset.projects = dataset.projects.map(dic)
+        if self.data_mode != 'cscc':
+            dic = {}
+            for project in dataset.projects.unique():
+                if project in ['TCGA-LUAD', 'TCGA-LUSC', 'TCGA_LUAD', 'TCGA_LUSC']:
+                    dic[project] = 'TCGA-LUNG'
+                elif project in ['TCGA-KICH', 'TCGA-KIRC', 'TCGA-KIRP', 'TCGA_KICH', 'TCGA_KIRC', 'TCGA_KIRP']:
+                    dic[project] = 'TCGA-KIDN'
+                elif project in ['TCGA-UCS', 'TCGA-UCEC']:
+                    dic[project] = 'TCGA-UTER'
+                else:
+                    dic[project] = project
+            dataset.projects = dataset.projects.map(dic)
+
 
         report = {'gene': list(dataset.genes)}
         if self.p_value == 'empirical':
@@ -475,16 +577,20 @@ class Experiment(object):
         train_patients_list = []
         valid_patients_list = []
         test_patients_list = []
+        
+        summarize_class(dataset)
 
         for k in range(n_folds):
             print(f"Running Fold {k}...")
+            if self.data_mode == 'cscc':
+                dataset._print_split_stats(train_idx[k], valid_idx[k], test_idx[k])
             fold_logdir = os.path.join(logdir, f'fold_{k}')
             os.makedirs(fold_logdir, exist_ok=True)
 
             train_set = Subset(dataset, train_idx[k])
             print("Shape of train_idx:", train_idx[k].shape, "first entries:", train_idx[k][:16])
             summarize_class(train_set)
-            summarize_class(dataset)
+            
             test_set = Subset(evalset, test_idx[k])
 
 
@@ -549,6 +655,9 @@ class Experiment(object):
             if self.null_run:
                 preds, labels = self._predict_without_training(
                     model, test_set, training_params)
+                fold_path = os.path.join(self.savedir, 'model_' + str(k))
+                os.makedirs(fold_path, exist_ok=True)
+                torch.save(model, os.path.join(fold_path, 'model.pt'))
             else:
                 optimizer = self._setup_optimization(model)
 

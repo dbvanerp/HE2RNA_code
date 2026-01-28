@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import time
 import os
+from datetime import datetime
 from torch import nn
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
@@ -79,6 +80,7 @@ class HE2RNA(nn.Module):
             return pred
 
     def forward_fixed_k(self, x, k):
+        k = min(k, x.shape[2])
         mask, _ = torch.max(x, dim=1, keepdim=True)
         mask = (mask > 0).float()
         x = self.conv(x) * mask
@@ -300,6 +302,7 @@ def fit(model,
     metrics = 'correlations'
     epoch_since_best = 0
     start_time = time.time()
+    history = []
 
     if valid_set is not None:
         valid_loss, best = evaluate(
@@ -332,6 +335,7 @@ def fit(model,
                     model, valid_loader, valid_projects)
                 dic_loss['valid_loss'] = valid_loss
                 score = np.mean(scores)
+                history.append(score)
                 writer.add_scalars('data/losses',
                                    dic_loss,
                                    e)
@@ -350,6 +354,7 @@ def fit(model,
                 criterion = (score > best)
 
                 if criterion:
+                    print(f"Epoch {e + 1} - New best score: {score:.3f}\nSaving model...\nDate & time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                     epoch_since_best = 0
                     best = score
                     if path is not None:
@@ -360,8 +365,21 @@ def fit(model,
                         preds, labels = predict(model, valid_loader)
 
                 if epoch_since_best == patience:
-                    print('Early stopping at epoch {}'.format(e + 1))
-                    break
+                    # Velocity check to override early stopping
+                    window = min(len(history), patience)
+                    recent_history = history[-window:]
+                    if len(recent_history) > 1:
+                        x_idxs = np.arange(len(recent_history))
+                        slope, _ = np.polyfit(x_idxs, recent_history, 1)
+                        if slope > 1e-4:
+                            print(f"Patience reached but model is improving (slope: {slope:.5f}). Giving 10 more epochs chance to reach new best... ")
+                            epoch_since_best = patience - 10
+                        else:
+                            print('Early stopping at epoch {}'.format(e + 1))
+                            break
+                    else:
+                        print('Early stopping at epoch {}'.format(e + 1))
+                        break
 
     except KeyboardInterrupt:
         pass
@@ -370,6 +388,7 @@ def fit(model,
         model = torch.load(os.path.join(path, 'model.pt'))
 
     elif path is not None:
+        # Edge case: model has never improved so no model.pt file exists yet
         torch.save(model, os.path.join(path, 'model.pt'))
 
     if test_set is not None:

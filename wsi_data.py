@@ -27,7 +27,7 @@ from torchvision.transforms import Compose
 from tqdm import tqdm
 from joblib import Parallel, delayed
 from constant import PATH_TO_TILES, PATH_TO_TRANSCRIPTOME
-
+from utils import summarize_class
 
 def load_labels(transcriptome_dataset):
     """Clean up RNAseq data and return labels, genes and patients.
@@ -53,7 +53,7 @@ def load_and_aggregate_file(file, reduce=True):
     if reduce:
         x = np.mean(x, axis=0)
     else:
-        x = np.concatenate((x, np.zeros((8000 - x.shape[0], 1536)))).transpose(1, 0) # 1536 = 1 + 2 + 1536, UNI2 shape
+        x = np.concatenate((x, np.zeros((8000 - x.shape[0], x.shape[1])))).transpose(1, 0) # x.shape[1] 1536 <= 1 + 2 + 1536, UNI2 shape
     return x
 
 def load_npy_data(file_list, reduce=True):
@@ -94,7 +94,7 @@ class AggregatedDataset(TensorDataset):
         self.genes = genes
         self.patients = patients
         self.projects = projects
-        self.dim = 1536 # 1539 = 1 + 2 + *1536*, UNI2 shape
+        self.dim = tensors[0].shape[1]
 
     @classmethod
     def match_transcriptome_data(cls, transcriptome_dataset):
@@ -133,7 +133,7 @@ class ToTensor(object):
         if x.shape[0] > self.n_tiles:
             x = x[:self.n_tiles]
         elif x.shape[0] < self.n_tiles:
-            x = torch.cat((x, torch.zeros((self.n_tiles - x.shape[0], 1539)))) # 1539 = 1 + 2 + 1536, UNI2 shape
+            x = torch.cat((x, torch.zeros((self.n_tiles - x.shape[0], x.shape[1]))))
         return x.t()
 
 
@@ -155,11 +155,65 @@ class TCGAFolder(Dataset):
         labels (list or np.array): the associated gene expression values.
         transform (callable): Preprocessing of the data.
         target_transform (callable): Preprocessing of the targets.
+        slide_filter (list or None): Optional list of slide names to keep (matching basename without extension).
     """
     def __init__(self, genes, patients, projects, projectname, file_list, labels,
                  transform=Compose([ToTensor(), RemoveCoordinates()]),
-                 target_transform=None, masks=None):
+                 target_transform=None, masks=None, slide_filter=None):
         root = PATH_TO_TILES
+        
+        # Apply slide filter if provided
+        # if slide_filter is not None:
+        if False:
+            print(f"Filtering TCGAFolder dataset with {len(slide_filter)} slides...")
+            # Extract slide names from file_list (basename without extension)
+            file_slide_names = [os.path.splitext(os.path.basename(f))[0] for f in file_list]
+            
+            # Create mapping from slide name to index
+            slide_to_idx = {name: i for i, name in enumerate(file_slide_names)}
+            
+            # Find indices that match filter, preserving filter order
+            indices = []
+            keep_mask = []
+            for slide in slide_filter:
+                if slide in slide_to_idx:
+                    indices.append(slide_to_idx[slide])
+                    keep_mask.append(True)
+                else:
+                    print(f"Warning: Slide {slide} not found in file list")
+                    keep_mask.append(False)
+            
+            if not indices:
+                raise ValueError(f"None of the {len(slide_filter)} filtered slides were found.")
+            
+            # Filter file_list and labels
+            file_list = [file_list[i] for i in indices]
+            if isinstance(labels, np.ndarray):
+                labels = labels[indices]
+            else:
+                labels = [labels[i] for i in indices]
+            
+            # Filter patients
+            if isinstance(patients, (pd.Series, pd.Index)):
+                patients = patients.iloc[indices]
+            elif isinstance(patients, np.ndarray):
+                patients = patients[indices]
+            else:
+                patients = np.array([patients[i] for i in indices])
+            
+            # Filter projects
+            if isinstance(projects, (pd.Series, pd.Index)):
+                projects = projects.iloc[indices]
+            elif isinstance(projects, np.ndarray):
+                projects = projects[indices]
+            else:
+                projects = np.array([projects[i] for i in indices])
+            
+            if not all(keep_mask):
+                print(f"Found {len(indices)} out of {len(slide_filter)} requested slides.")
+            else:
+                print(f"All {len(indices)} requested slides found.")
+        
         samples = make_dataset(root, file_list, labels)
         if len(samples) == 0:
             raise(RuntimeError("Found 0 files in subfolders of: " + root + "\n"))
@@ -176,11 +230,22 @@ class TCGAFolder(Dataset):
         self.target_transform = target_transform
 
         self.genes = genes
-        self.dim = 1536 # 1539 = 1 + 2 + *1536*, UNI2 shape
         self.masks = masks
+        # Infer dim from the first sample
+        sample_0, _ = self[0]
+        self.dim = sample_0.shape[0] - 3
+        
 
     @classmethod
-    def match_transcriptome_data(cls, transcriptome_dataset, binarize=False):
+    def match_transcriptome_data(cls, transcriptome_dataset, binarize=False, slide_filter=None):
+        """Use a TranscriptomeDataset object to read corresponding .npy files.
+
+        Args
+            transcriptome_dataset (TranscriptomeDataset)
+            binarize (bool): If True, target gene expressions are binarized with
+                respect to their median value.
+            slide_filter (list or None): Optional list of slide names to keep (matching slide_name without extension).
+        """
         projectname = transcriptome_dataset.projectname
         labels, cols, patients, projects = load_labels(transcriptome_dataset)
         file_list = []
@@ -192,7 +257,12 @@ class TCGAFolder(Dataset):
             else:
                 file_path = os.path.join(project_dir, filename)
             file_list.append(file_path)
-        return cls(cols, patients, projects, projectname, file_list, labels)
+        
+        # If no slide_filter provided, use slide names from metadata (similar to H5Dataset)
+        if slide_filter is None:
+            slide_filter = [os.path.splitext(s)[0] for s in transcriptome_dataset.metadata['Slide.ID'].values]
+        
+        return cls(cols, patients, projects, projectname, file_list, labels, slide_filter=slide_filter)
 
     def __getitem__(self, index):
         path, target = self.samples[index]
@@ -221,32 +291,81 @@ class H5Dataset(Dataset):
         filename (str): path to the hdf5 file containing the data.
         labels (list or np.array): the associated gene expression values.
         max_items (int): Maximum number of tiles to use for training.
+        slide_filter (list or None): Optional list of slide names to keep (matching slide_name in H5).
     """
-    def __init__(self, genes, patients, projects, filename, labels, max_items=8000, in_memory=True):
+    def __init__(self, genes, patients, projects, filename, labels, max_items=8000, in_memory=True, slide_filter=None):
         self.in_memory = in_memory
         self.max_items = max_items
         self.targets = labels
         self.genes = genes
         self.patients = patients
         self.projects = projects
-        self.filename = filename  # Store filename, not the file object!
+        self.filename = filename 
+        self.indices = None
         
+        # if slide_filter is not None:
+        #     print(f"Filtering H5 dataset with {len(slide_filter)} slides...")
+        #     with h5py.File(self.filename, 'r') as f:
+        #         if 'slide_name' not in f:
+        #             raise KeyError(f"Dataset 'slide_name' not found in {self.filename}. Cannot filter.")
+                
+        #         h5_slides = f['slide_name'][:]
+        #         # Decode if they are bytes
+        #         if h5_slides.dtype.kind in ['S', 'V']:
+        #             h5_slides = np.array([s.decode('utf-8') for s in h5_slides])
+                
+        #         # Create a mapping from slide name to H5 index
+        #         slide_to_idx = {name: i for i, name in enumerate(h5_slides)}
+                
+        #         # Find indices in H5 that match our filtered slides, in the CORRECT ORDER
+        #         indices = []
+        #         keep_mask = []
+        #         for slide in slide_filter:
+        #             if slide in slide_to_idx:
+        #                 indices.append(slide_to_idx[slide])
+        #                 keep_mask.append(True)
+        #             else:
+        #                 print(f"Warning: Slide {slide} not found in H5 file")
+        #                 keep_mask.append(False)
+                
+        #         if not indices:
+        #             raise ValueError(f"None of the {len(slide_filter)} filtered slides were found in the H5 file.")
+                
+        #         self.indices = np.array(indices)
+                
+        #         # We must also filter labels, patients, projects to match the slides actually found in H5
+        #         if not all(keep_mask):
+        #             print(f"Found {len(indices)} out of {len(slide_filter)} requested slides in H5.")
+        #             self.targets = self.targets[keep_mask]
+        #             # Handle both numpy arrays and pandas Series/Index
+        #             if isinstance(self.patients, (pd.Series, pd.Index)):
+        #                 self.patients = self.patients[keep_mask]
+        #             else:
+        #                 self.patients = self.patients[keep_mask]
+                    
+        #             if isinstance(self.projects, (pd.Series, pd.Index)):
+        #                 self.projects = self.projects[keep_mask]
+        #             else:
+        #                 self.projects = self.projects[keep_mask]
+
         if self.in_memory:
             print(f"Loading {filename} into RAM...")
             with h5py.File(self.filename, 'r') as f:
-                # Slice directly to numpy to avoid keeping h5 references
-                data = f['X'][:, :self.max_items, 3:]
+                if self.indices is not None:
+                    # h5py requires indices to be in increasing order
+                    sort_idx = np.argsort(self.indices)
+                    rev_idx = np.argsort(sort_idx)
+                    
+                    data = f['X'][self.indices[sort_idx], :self.max_items, 3:]
+                    # Restore original metadata order
+                    data = data[rev_idx]
+                else:
+                    data = f['X'][:, :self.max_items, 3:]
             print(f"Shape of h5 file data: {data.shape}")
 
-            # These lines convert the 'data' array (read from the HDF5 file) to float32 type for lower memory usage,
-            # then convert it to a PyTorch tensor, and finally permute its dimensions so that the shape becomes (batch, features, tiles).
-            # - np.asarray(data, dtype=np.float32): Ensures the array is float32, reducing RAM usage vs float64.
-            # - torch.from_numpy(...): Converts the numpy array to a PyTorch tensor.
-            # - .permute(0, 2, 1): Changes the tensor's shape from (num_samples, num_tiles, tile_dim) to (num_samples, tile_dim, num_tiles), 
-            #   matching model/data loader expectations for downstream code.
-            # - .contiguous(): Returns a contiguous tensor in memory (often needed after permute for PyTorch compatibility).
 
             data = np.asarray(data, dtype=np.float32)
+            
             self.data = torch.from_numpy(data).permute(0, 2, 1).contiguous()
             
             self.length = self.data.shape[0]
@@ -256,9 +375,26 @@ class H5Dataset(Dataset):
         else:
             # Just get metadata here, DO NOT open the file yet
             with h5py.File(self.filename, 'r') as f:
-                self.length = f['X'].shape[0]
-                self.dim = f['X'].shape[2]
+                if self.indices is not None:
+                    self.length = len(self.indices)
+                else:
+                    self.length = f['X'].shape[0]
+                self.dim = f['X'].shape[2] - 3
             self.file_handle = None # Placeholder
+
+    @classmethod
+    def match_transcriptome_data(cls, transcriptome_dataset, filename, max_items=8000, in_memory=True):
+        """Use a TranscriptomeDataset object to read corresponding .h5 file.
+
+        Args
+            transcriptome_dataset (TranscriptomeDataset)
+            filename (str): Path to the H5 file.
+        """
+        labels, genes, patients, projects = load_labels(transcriptome_dataset)
+        # slide_names in metadata usually have .npy, but H5 slide_name doesn't
+        slide_names = [os.path.splitext(s)[0] for s in transcriptome_dataset.metadata['Slide.ID'].values]
+        return cls(genes, patients, projects, filename, labels, 
+                   max_items=max_items, in_memory=in_memory, slide_filter=slide_names)
 
     def __getitem__(self, index):
         if self.in_memory:
@@ -269,7 +405,8 @@ class H5Dataset(Dataset):
                  self.file_handle = h5py.File(self.filename, 'r')
             
             # Read specific chunk
-            data_numpy = self.file_handle['X'][index, :self.max_items, 3:]
+            real_index = self.indices[index] if self.indices is not None else index
+            data_numpy = self.file_handle['X'][real_index, :self.max_items, 3:]
             sample = torch.from_numpy(data_numpy.astype(np.float32)).t()
 
         target = self.targets[index]
@@ -294,7 +431,7 @@ def patient_split(dataset, random_state=0):
         patients_unique, test_size=0.2, random_state=random_state)
     patients_valid, patients_test = train_test_split(
         patients_valid, test_size=0.5, random_state=random_state)
-
+    summarize_class(dataset)
     indices = np.arange(len(dataset))
     train_idx = indices[np.any(dataset.patients[:, np.newaxis] ==
                                patients_train[np.newaxis], axis=1)]
@@ -324,7 +461,8 @@ def match_patient_split(dataset, split):
 def patient_kfold(dataset, n_splits=5, random_state=0, valid_size=0.1):
     """Perform cross-validation with patient split.
     """
-    print("Starting patient_kfold() function...")
+    print("Starting patient_kfold() function with following dataset...")
+    summarize_class(dataset)
     indices = np.arange(len(dataset))
     print(f"Number of indices: {len(indices)}")
     patients_unique = np.unique(dataset.patients)
@@ -353,7 +491,7 @@ def patient_kfold(dataset, n_splits=5, random_state=0, valid_size=0.1):
 
         train_idx.append(indices[np.any(dataset.patients[:, np.newaxis] ==
                                         patients_train[np.newaxis], axis=1)])
-
+        print(f"Fold {k} has {len(train_idx[k])} training samples, {len(valid_idx[k])} validation samples, and {len(test_idx[k])} test samples")
     return train_idx, valid_idx, test_idx
 
 
