@@ -28,8 +28,12 @@ from matplotlib import gridspec
 import torch
 from tqdm import tqdm
 from torch import nn
+from concurrent.futures import ThreadPoolExecutor
 from sklearn.metrics import roc_curve, roc_auc_score
 from scipy.stats import pearsonr, spearmanr
+
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def compute_heatmap(path_to_model, path_to_tile_features):
@@ -38,15 +42,18 @@ def compute_heatmap(path_to_model, path_to_tile_features):
     coords = X_he[:, :3]
         
     all_scores = []
-    x = torch.Tensor(X_he[np.newaxis].transpose(1, 2, 0))
+    x = torch.Tensor(X_he[np.newaxis].transpose(1, 2, 0)).to(DEVICE)
     clusters = np.arange(X_he.shape[0])
-
-    # Load all models from cross_validation on TCGA
-    models = [torch.load(f'{path_to_model}/model_' +
-                         str(k) + '/model.pt', map_location='cpu') for k in range(5)]
+    if os.path.isdir(path_to_model):
+        models = [torch.load(f'{path_to_model}/model_' +
+                             str(k) + '/model.pt', map_location=DEVICE) for k in range(5)]
+    else:
+        models = [torch.load(path_to_model, map_location=DEVICE)]
 
     for model in tqdm(models):
-        all_scores.append(model.conv(x).detach().numpy())
+        all_scores.append(model.conv(x).detach().cpu().numpy())
+        # all_scores = np.exp(all_scores) - 1 # back log transform, not in OG code
+
     print(len(all_scores))
     # Average over genes and cross-val folds
     tile_scores = np.mean(all_scores, axis=(0, 2))[:, 0]
@@ -55,8 +62,22 @@ def compute_heatmap(path_to_model, path_to_tile_features):
 
 
 def display_heatmap(path_to_slide, coords, tile_scores, path=None,
-                   vmin=None, vmax=None, vmin_pct=2, vmax_pct=98):
+                   vmin=None, vmax=None, vmin_pct=10, vmax_pct=99,
+                   heatmap_only_path=None):
+    """
+    Display a heatmap overlay and optionally save a publication-quality heatmap+scale.
 
+    Args:
+        path_to_slide: Path to slide (.svs).
+        coords: Tile coordinates, shape (N, 3).
+        tile_scores: Per-tile scores, shape (N,).
+        path: Path to save the two-panel display (optional).
+        vmin: Minimum value for color scaling (optional).
+        vmax: Maximum value for color scaling (optional).
+        vmin_pct: Percentile for autogenerating vmin if vmin not supplied.
+        vmax_pct: Percentile for autogenerating vmax if vmax not supplied.
+        heatmap_only_path: If given, output a high-quality, heatmap+scale-only PNG.
+    """
     slide_he = openslide.OpenSlide(path_to_slide)
     print(f'Dimensions of the slide: {slide_he.dimensions}')
 
@@ -69,7 +90,7 @@ def display_heatmap(path_to_slide, coords, tile_scores, path=None,
     ax1.set_yticks([])
 
     n_tiles = zoom_he.level_tiles[int(coords[0, 0])]
-    grid = (np.array(im.shape[:2]) / n_tiles[::-1]) 
+    grid = (np.array(im.shape[:2]) / n_tiles[::-1])
 
     score = tile_scores
     # Determine display range for better contrast
@@ -86,36 +107,64 @@ def display_heatmap(path_to_slide, coords, tile_scores, path=None,
 
     mask = np.zeros_like(im[:, :, 0]).astype(float)
     for s, coord in zip(score, coords):
-        x = int((coord[2] + 6))
-        y = int((coord[1] + 3))
+        # Remove unnecessary padding by not adding manual offsets
+        x = int(coord[2])
+        y = int(coord[1])
         mask[int(x * grid[0]): int((x + 1) * grid[0]),
              int(y * grid[0]): int((y + 1) * grid[0])] = s
+
     ims = ax2.imshow(mask, cmap='inferno', vmin=vmin_val, vmax=vmax_val)
     ax2.set_xticks([])
     ax2.set_yticks([])
     cbar = plt.colorbar(ims, ax=ax2)
-    cbar.ax.tick_params(labelsize=16) 
+    cbar.ax.tick_params(labelsize=16)
 
     if path is not None:
-        plt.savefig(path)
-    else:
-        plt.show()
-    plt.close()
+        plt.savefig(path, bbox_inches='tight', dpi=300)
+        heatmap_only_path = path.replace('.png', '_heatmap_only.png')
 
+    plt.close(fig)
+
+    # --- Save heatmap+scale only version, high quality ---
+    if heatmap_only_path is not None:
+        # Make the background white by setting facecolor='white'
+        fig2, ax = plt.subplots(1, 1, facecolor='white')
+        fig2.set_size_inches((8, 8))
+        ims2 = ax.imshow(mask, cmap='inferno', vmin=vmin_val, vmax=vmax_val)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        cbar2 = plt.colorbar(ims2, ax=ax, shrink=0.9, pad=0.02)
+        cbar2.ax.tick_params(labelsize=18)
+        fig2.tight_layout(pad=0.2)
+        fig2.savefig(heatmap_only_path, bbox_inches='tight', dpi=300, facecolor='white')
+        plt.close(fig2)
+    else:
+        if path is None:
+            # Only show if not saving to file
+            plt.figure()
+            plt.imshow(mask, cmap='inferno', vmin=vmin_val, vmax=vmax_val)
+            plt.xticks([])
+            plt.yticks([])
+            plt.colorbar()
+            plt.show()
 def compute_aucs_CRC(path_to_model, path_to_tiles):
     scores = []
     cats = ['LYM', 'ADI', 'STR', 'NORM', 'TUM', 'DEB', 'MUS', 'MUC', 'BACK']
+
+    if os.path.isdir(path_to_model):
+        models = [torch.load(f'{path_to_model}/model_' + str(k) +
+                         '/model.pt', map_location=DEVICE) for k in range(5)]
+    else:
+        models = [torch.load(path_to_model, map_location=DEVICE)]
+
     for cat in tqdm(cats):
         all_scores = []
         X_he = np.load(os.path.join(path_to_tiles, f'{cat}.npy'))
-        x = torch.Tensor(X_he.transpose(1, 2, 0))
+        x = torch.Tensor(X_he.transpose(1, 2, 0)).to(DEVICE)
         clusters = np.arange(X_he.shape[0])
 
-        models = [torch.load(f'{path_to_model}/model_' + str(k) +
-                         '/model.pt', map_location='cpu') for k in range(5)]
-
         for model in models:
-            all_scores.append(model.conv(x).detach().numpy())
+            all_scores.append(model.conv(x).detach().cpu().numpy())
 
         all_scores = np.mean(all_scores, axis=(0, 1, 2))
         scores.append(all_scores)
@@ -132,9 +181,7 @@ def compute_aucs_CRC(path_to_model, path_to_tiles):
 
 
 def post_processing(seg):
-    seg = seg[:, :, 0]
-    seg = (seg > 1).astype(float)
-    return np.mean(np.clip(seg, 0, 1))
+    return (seg[:, :, 0] > 1).mean()
 
 
 def compute_correlation_PESO(path_to_model, path_to_tiles, path_to_masks, corr='pearson', per_slide=False):
@@ -143,8 +190,13 @@ def compute_correlation_PESO(path_to_model, path_to_tiles, path_to_masks, corr='
     per_slide_corrs = []
     files = os.listdir(path_to_tiles)
     ns = np.unique([file.split('_')[1] for file in files])
-    models = [torch.load(f'{path_to_model}/model_' + str(k) +
-                         '/model.pt', map_location='cpu') for k in range(5)]
+
+    if os.path.isdir(path_to_model):
+        models = [torch.load(f'{path_to_model}/model_' + str(k) +
+                         '/model.pt', map_location=DEVICE) for k in range(5)]
+    else:
+        models = [torch.load(path_to_model, map_location=DEVICE)]
+
     for n in tqdm(ns):
 
         X_he = np.load(os.path.join(path_to_tiles, f'pds_{n}_HE.npy'))
@@ -154,20 +206,24 @@ def compute_correlation_PESO(path_to_model, path_to_tiles, path_to_masks, corr='
         zoom_mask = openslide.deepzoom.DeepZoomGenerator(mask_, tile_size=224, overlap=0)
 
         tile_scores = []
-        x = torch.Tensor(X_he[np.newaxis].transpose(1, 2, 0))
+        x = torch.Tensor(X_he[np.newaxis].transpose(1, 2, 0)).to(DEVICE)
         clusters = np.arange(X_he.shape[0])
 
         for model in models:
-            tile_scores.append(model.conv(x).detach().numpy())
+            tile_scores.append(model.conv(x).detach().cpu().numpy())
         tile_scores = np.mean(tile_scores, axis=(0, 2, 3))
         scores.append(tile_scores)
 
         gt = []
-        for coord in tqdm(coords):
+        def get_gt_tile(coord):
             img_mask = np.array(
                 zoom_mask.get_tile(int(coord[0]), (int(coord[1]), int(coord[2]))))
-            ep = post_processing(img_mask)
-            gt.append(np.mean(ep))
+
+            return post_processing(img_mask)
+
+        with ThreadPoolExecutor() as executor:
+            gt = list(tqdm(executor.map(get_gt_tile, coords), total=len(coords), leave=False))
+
         gt = np.array(gt)
         print(gt.shape, gt[:5], tile_scores.shape, tile_scores[:5])
         print(f"GT mean: {np.mean(gt):.4f}, std: {np.std(gt):.4f}")
@@ -199,18 +255,20 @@ def main():
     parser.add_argument("--slides_dir", help="directory containing slides for batch heatmap generation")
     parser.add_argument("--path_to_masks", help="path to folder containing training masks from PESO")
     parser.add_argument("--corr", help="type of correlation to compute, pearson or spearman", default='pearson')
-    parser.add_argument("--per_slide_corr", action='store_true',
+    parser.add_argument("--per_slide_corr", action='store_true', default=True,
                         help="also report correlation per slide in PESO experiment")
     parser.add_argument("--heatmap_vmin", type=float, default=None,
                         help="absolute minimum value for heatmap color scale")
     parser.add_argument("--heatmap_vmax", type=float, default=None,
                         help="absolute maximum value for heatmap color scale")
-    parser.add_argument("--heatmap_vmin_pct", type=float, default=2,
-                        help="percentile for min when vmin not set (default 2)")
-    parser.add_argument("--heatmap_vmax_pct", type=float, default=98,
-                        help="percentile for max when vmax not set (default 98)")
+    parser.add_argument("--heatmap_vmin_pct", type=float, default=10,
+                        help="percentile for min when vmin not set (default 10)")
+    parser.add_argument("--heatmap_vmax_pct", type=float, default=99,
+                        help="percentile for max when vmax not set (default 99)")
     parser.add_argument("--output_path", help="path to save the heatmap")
     args = parser.parse_args()
+
+    print(f"Using device: {DEVICE}")
     if args.output_path is not None:
         os.makedirs(args.output_path, exist_ok=True)
 
@@ -237,25 +295,29 @@ def main():
             if len(slide_paths) == 0:
                 raise ValueError(f"No slides found in {args.slides_dir}")
             for slide_path in slide_paths:
-                slide_name = os.path.splitext(os.path.basename(slide_path))[0]
-                tiles_path = args.path_to_tiles
-                if os.path.isdir(tiles_path):
-                    tile_features_path = os.path.join(tiles_path, f"{slide_name}.npy")
-                else:
-                    tile_features_path = tiles_path
+                if True:
+                    slide_name = os.path.splitext(os.path.basename(slide_path))[0]
+                    tiles_path = args.path_to_tiles
+                    if os.path.isdir(tiles_path):
+                        tile_features_path = os.path.join(tiles_path, f"{slide_name}.npy")
+                    else:
+                        tile_features_path = tiles_path
 
-                if not os.path.exists(tile_features_path):
-                    print(f"Tile features not found for slide {slide_name} at {tile_features_path}, skipping.")
-                    continue
+                    if not os.path.exists(tile_features_path):
+                        print(f"Tile features not found for slide {slide_name} at {tile_features_path}, skipping.")
+                        continue
 
-                coords, tile_scores = compute_heatmap(args.path_to_model, tile_features_path)
-                output_file = os.path.join(args.output_path, f"{slide_name}_heatmap.png")
-                print(f"Saving heatmap for {slide_name} to {output_file}")
-                display_heatmap(
-                    slide_path, coords, tile_scores, output_file,
-                    vmin=args.heatmap_vmin, vmax=args.heatmap_vmax,
-                    vmin_pct=args.heatmap_vmin_pct, vmax_pct=args.heatmap_vmax_pct
-                )
+                    coords, tile_scores = compute_heatmap(args.path_to_model, tile_features_path)
+                    output_file = os.path.join(args.output_path, f"{slide_name}_heatmap.png")
+                    print(f"Saving heatmap for {slide_name} to {output_file}")
+                    
+                    display_heatmap(
+                        slide_path, coords, tile_scores, output_file,
+                        vmin=args.heatmap_vmin, vmax=args.heatmap_vmax,
+                        vmin_pct=args.heatmap_vmin_pct, vmax_pct=args.heatmap_vmax_pct
+                    )
+                else: 
+                    print(f"Skipping heatmap for {slide_path} because it does not contain '60' in the path")
         elif args.slides:
             if args.output_path is None:
                 raise ValueError("output_path is required when generating multiple heatmaps.")
