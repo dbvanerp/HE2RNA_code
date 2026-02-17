@@ -26,7 +26,7 @@ class CSCCDataset(Dataset):
     Args:
         features_dir: Directory with H5 files (one per patient)
         targets_csv: CSV with RNA counts (ID column = skylinedx_id)
-        keyfile_path: CSV mapping skylinedx_id_rsm2 -> study_number
+        keyfile_paths: Comma-separated list of CSV paths mapping skylinedx_id_rsm2 -> study_number, QC status, CP Score etc
         genes: Optional list of gene columns to use (None = all)
         max_tiles: Max tiles per patient for padding
         log_transform: Whether to log10(1+x) transform targets
@@ -36,7 +36,7 @@ class CSCCDataset(Dataset):
         self,
         features_dir: str,
         targets_csv: str,
-        keyfile_path: str,
+        keyfile_paths: str,
         genes: Optional[List[str]] = None,
         max_tiles: int = 8000,
         log_transform: bool = True,
@@ -48,9 +48,10 @@ class CSCCDataset(Dataset):
         self.max_tiles = max_tiles
         self.log_transform = log_transform
         self.project_column = project_column
+        self.keyfile_paths = keyfile_paths.split(',')
 
         # Load keyfile for ID mapping
-        self.id_to_study = self._load_keyfile(keyfile_path)
+        self.id_to_study = self._load_keyfile(self.keyfile_paths)
         
         # Load features index (study_number -> h5_path)
         self.feature_files = self._index_features()
@@ -75,28 +76,54 @@ class CSCCDataset(Dataset):
         # Infer feature dimension
         self.feature_dim = self._get_feature_dim()
         
-        self.metadata = self._load_metadata(keyfile_path)
+        self.metadata = self._load_metadata(self.keyfile_paths[0])
 
         print(f"\n{'-'*15} CSCCDataset initialized: {len(self)} patients, {len(self.genes)} genes, {self.feature_dim}D features {'-'*15}\n")
         print(f"Full summary of the dataset:")
         summarize_class(self)
     
-    def _load_keyfile(self, keyfile_path: str) -> dict:
+    def _load_keyfile(self, keyfile_paths: List[str]) -> dict:
         """Load keyfile and filter by QC status."""
         print(f"\nFiltering patients by QC status")
-        keyfile = pd.read_csv(keyfile_path)
+        for keyfile_path in keyfile_paths:
+            if 'rsm2' in keyfile_path:
+                keyfile_rsm2 = pd.read_csv(keyfile_path)
+            elif 'DSQUAME' in keyfile_path:
+                keyfile_DSQUAME = pd.read_csv(keyfile_path)
+            else:
+                raise ValueError(f"Invalid keyfile path, expecting 'rsm2' or 'DSQUAME' in the paths: {keyfile_path}")
+
+        original_set = set(keyfile_rsm2['sample_id'])
+        # Only include rows where 'CP Score' is not NA/nan
+        keyfile_DSQUAME = keyfile_DSQUAME[keyfile_DSQUAME['CP_score'].notna()]
+        print(f"  Found {len(keyfile_DSQUAME)} rows with non-NA CP Score in DSQUAME keyfile after filtering out {len(keyfile_DSQUAME[keyfile_DSQUAME['CP_score'].isna()])} rows with NA CP Score")
+        # Build one big list where each Sample_id is split on '+' if present, else just the id
+        all_rsm1_ids = []
+        for sid in keyfile_DSQUAME['Sample_id']:
+            if '+' in str(sid):
+                all_rsm1_ids.extend([s.strip() for s in str(sid).split('+')])
+            else:
+                all_rsm1_ids.append(str(sid).strip())
+        print(f"  Found {len(all_rsm1_ids)} split Sample_ids in DSQUAME keyfile (flattened list)")
+
+        # Keep only rows of keyfile_rsm2 that have 'sample_id' entry in all_rsm1_ids
+        keyfile_rsm2 = keyfile_rsm2[keyfile_rsm2['sample_id'].astype(str).isin(all_rsm1_ids)]
+        filtered_set = set(keyfile_rsm2['sample_id'])
+        print(f"  Filtered out {len(original_set - filtered_set)} patients due to missing (split) Sample_id in DSQUAME keyfile. Remaining: {len(filtered_set)}")
+        print(f"  All missing Sample_ids: {original_set - filtered_set}")
+
         
-        if 'rna_qc_status' in keyfile.columns:
-            initial_count = len(keyfile)
+        if 'rna_qc_status' in keyfile_rsm2.columns:
+            initial_count = len(keyfile_rsm2)
             # Normalize to lowercase and strip whitespace to be safe
             # Handle potential NaN values by converting to string first
-            keyfile = keyfile[keyfile['rna_qc_status'].astype(str).str.lower().str.strip() != 'fail']
-            filtered_count = len(keyfile)
+            keyfile_rsm2 = keyfile_rsm2[keyfile_rsm2['rna_qc_status'].astype(str).str.lower().str.strip() != 'fail']
+            filtered_count = len(keyfile_rsm2)
             print(f"  Filtered out {initial_count - filtered_count} patients due to QC failure. Remaining: {filtered_count}")
         else:
             print("  Warning: 'rna_qc_status' column not found in keyfile. Skipping QC filtering.")
             
-        return dict(zip(keyfile['skylinedx_id_rsm2'], keyfile['study_number']))
+        return dict(zip(keyfile_rsm2['skylinedx_id_rsm2'], keyfile_rsm2['study_number']))
 
     def _index_features(self) -> dict:
         """Map study_number -> h5 file path."""
@@ -313,7 +340,7 @@ class CSCCDataset(Dataset):
     
     def _build_sample_groups(self) -> Tuple[List[List[str]], List[str]]:
         """
-        Group samples by rsm1_matching_set_id to prevent pair leakage.
+        Group samples by matching_set_id to prevent pair leakage.
         Samples with NaN or unique IDs become singleton groups.
         
         Returns:
@@ -324,7 +351,7 @@ class CSCCDataset(Dataset):
         group_labels = []
         
         # Get pair IDs and tissue types for all study_numbers in the dataset
-        pair_ids = self.metadata.loc[self.study_numbers, 'rsm1_matching_set_id']
+        pair_ids = self.metadata.loc[self.study_numbers, 'matching_set_id']
         tissue_types = self.metadata.loc[self.study_numbers, 'tissue_type']
         
         # Track which study_numbers have been assigned to a group
@@ -435,7 +462,7 @@ class CSCCDataset(Dataset):
         """
         Single 80/10/10 stratified split with pair protection.
         
-        Pairs (same rsm1_matching_set_id) stay together in the same split.
+        Pairs (same matching_set_id) stay together in the same split.
         Stratifies by tissue_type to maintain ratios across splits.
         
         Args:
@@ -498,7 +525,7 @@ class CSCCDataset(Dataset):
         """
         K-fold cross-validation with stratification and pair protection.
         
-        Pairs (same rsm1_matching_set_id) stay together in the same split.
+        Pairs (same matching_set_id) stay together in the same split.
         Stratifies by tissue_type to maintain ratios across folds.
         
         Args:
@@ -600,7 +627,7 @@ def cscc_collate_with_ids(batch):
 if __name__ == "__main__":
     features_dir = "/gpfs/work4/0/prjs1086/derm_shared/cscc/processed/he_packed_patch_feat_uni/rsm2/h5_files"
     targets_csv = "/gpfs/work4/0/prjs1086/derm_shared/cscc/processed/rna_counts/txi.gene.counts.csv"
-    keyfile_path = "/gpfs/work4/0/prjs1086/derm_shared/cscc/doc/keyfiles/20260113_project_keyfile_anonymized_rsm2.csv"
+    keyfile_paths = "/gpfs/work4/0/prjs1086/derm_shared/cscc/doc/keyfiles/20260113_project_keyfile_anonymized_rsm2.csv,/gpfs/work4/0/prjs1086/derm_shared/cscc/processed/cd/DSQUAME_development_NCC_dataset_clean_no_newlines.csv"
     genes = "/home/dvanerp/pepsi/data/processed/cscc_rna/bailey_dvp_signature_annotated.csv"
 
 
@@ -610,12 +637,12 @@ if __name__ == "__main__":
     else:
         genes = genes.split(',')
     for gene in genes:
-        print(gene)
+        # print(gene)
         assert gene.startswith('ENSG'), "Unknown gene format"
     dataset = CSCCDataset(
         features_dir=features_dir,
         targets_csv=targets_csv,
-        keyfile_path=keyfile_path,
+        keyfile_paths=keyfile_paths,
         max_tiles=8000,
         genes=genes
     )

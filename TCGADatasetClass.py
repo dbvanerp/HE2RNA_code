@@ -115,9 +115,9 @@ class TCGADataset(Dataset):
 
         # Select genes
         if genes is None:
-            # Auto-detect gene columns (adjust pattern as needed)
-            self.genes = [c for c in self.targets_df.columns if c not in ['ID', 'sample_id']]
-            print(f"No gene filter provided. Auto-detected {len(self.genes)} genes")
+            # Auto-detect gene columns and exclude metadata columns like File.ID/Case.ID/Project.ID.
+            self.genes = [c for c in self.targets_df.columns if str(c).startswith('ENSG')]
+            print(f"No gene filter provided. Auto-detected {len(self.genes)} ENSG gene columns")
         else:
             self.genes = self._filter_genes_by_list(genes)
         
@@ -182,10 +182,20 @@ class TCGADataset(Dataset):
             projects = self.project_filter
 
         for project in projects:
-            for f in os.listdir(os.path.join(self.features_dir, project, zoom_folder)):
+            project_dir = os.path.join(self.features_dir, project)
+            if not os.path.isdir(project_dir):
+                continue
+
+            # Support both layouts:
+            # 1) <features_dir>/<project>/0.50_mpp/*.npy
+            # 2) <features_dir>/<project>/*.npy
+            zoom_dir = os.path.join(project_dir, zoom_folder)
+            search_dir = zoom_dir if os.path.isdir(zoom_dir) else project_dir
+
+            for f in os.listdir(search_dir):
                 if f.endswith('.npy'):
                     sample_id = os.path.splitext(f)[0]
-                    feature_files[sample_id] = os.path.join(self.features_dir, project, zoom_folder, f)
+                    feature_files[sample_id] = os.path.join(search_dir, f)
         print(f"  Found {len(feature_files)} .npy feature files")
         return feature_files
 
@@ -202,8 +212,12 @@ class TCGADataset(Dataset):
         else:
             # Genes are provided in the format ENSG00000000003.15. Use only the genes in the list to save memory
             print(f"  Loading only the provided genes to save memory: {len(self.genes)} genes")
-            usecols = self.genes + ['File.ID', 'Sample.ID', 'Case.ID', 'Project.ID']
-            df = pd.read_csv(targets_csv, index_col="Sample.ID", usecols=usecols)
+            try:
+                usecols = self.genes + ['File.ID', 'Sample.ID', 'Case.ID', 'Project.ID']
+                df = pd.read_csv(targets_csv, index_col="Sample.ID", usecols=usecols)
+            except:
+                print(f"  Error: Could not load targets CSV with provided genes using usecols (likely versioning mismatches). \n  Trying again with all genes, filtering later.")
+                df = pd.read_csv(targets_csv, index_col="Sample.ID")
         # Target sample IDs are of form TCGA-02-0003-01A, len 16
         # self.filtered_keyfile is a set of sample IDs after filtering (for O(1) lookup)
         
@@ -474,8 +488,19 @@ class TCGADataset(Dataset):
             else:
                 raise ValueError(f"Truncated sample ID {trunc_sid} (from {full_sid}) not found in targets_df")
         
-        # Extract target values using the row indices
-        targets = self.targets_df.iloc[target_rows][self.genes].values.astype(np.float32)
+        # Extract target values using the row indices.
+        # Guard against accidental metadata/string columns by coercing and validating.
+        target_frame = self.targets_df.iloc[target_rows][self.genes]
+        target_frame_numeric = target_frame.apply(pd.to_numeric, errors='coerce')
+        if target_frame_numeric.isna().any().any():
+            bad_cols = target_frame_numeric.columns[target_frame_numeric.isna().any()].tolist()
+            bad_preview = target_frame[bad_cols].head(1).to_dict(orient='records')
+            raise ValueError(
+                "Non-numeric values found in target columns. "
+                f"Likely non-gene columns were selected. Bad columns: {bad_cols[:5]}; "
+                f"preview: {bad_preview}"
+            )
+        targets = target_frame_numeric.values.astype(np.float32)
         
         if self.log_transform:
             targets = np.log10(1 + targets)

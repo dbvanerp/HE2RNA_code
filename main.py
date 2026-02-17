@@ -53,11 +53,19 @@ class Experiment(object):
     def __init__(self,
                  configfile='config.ini',
                  null_run=False):
-
+        print(f"Initializing the Experiment class")
         # Read configuration file
         self.config = configparser.ConfigParser()
         self.config.read(configfile)
 
+        print("========== Loaded Config ==========")
+        for section in self.config.sections():
+            print(f"[{section}]")
+            for key, value in self.config[section].items():
+                print(f"{key}: {value}")
+            print()
+        print("===================================\n")
+        
         assert 'main' in self.config.sections(), \
             "No 'main' section in config file"
 
@@ -540,9 +548,11 @@ class Experiment(object):
                 raise ValueError(f"Invalid data mode: {self.data_mode}")
         else:
             # match_patient_kfold for now is defined only in the TCGA Dataset class.
+            # TODO check the zipping and unpickling of the splits file
+            # TODO check if match_patient_kfold also works for CSCC 
             print(f"Using provided splits file")
             train_patients, valid_patients, test_patients = self.splits
-            splits = zip(train_patients, valid_patients, test_patients)
+            splits = (train_patients, valid_patients, test_patients)
             train_idx, valid_idx, test_idx = match_patient_kfold(dataset, splits)
 
         if self.data_mode != 'cscc':
@@ -764,7 +774,8 @@ def main():
             exp.savedir = args.output_dir
             if not os.path.exists(exp.savedir):
                 os.makedirs(exp.savedir, exist_ok=True)
-
+        print(f"Path where models will be saved: \n{exp.savedir}")
+        print(f"TensorboardX logdir: \n{args.logdir}")
         assert args.run in ['single_run', 'cross_validation'], \
             "Unrecognized experiment, must be either 'single_run' or 'cross_validation"
         if args.run == 'single_run':
