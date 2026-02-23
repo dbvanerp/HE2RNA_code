@@ -43,7 +43,7 @@ class HE2RNA(nn.Module):
     """
     def __init__(self, input_dim, output_dim,
                  layers=[1], nonlin=nn.ReLU(), ks=[10],
-                 dropout=0.5, device='cpu',
+                 dropout=0.5, device='cpu', proportional_ks=False,
                  bias_init=None, **kwargs):
         super(HE2RNA, self).__init__()
 
@@ -63,14 +63,20 @@ class HE2RNA(nn.Module):
         if bias_init is not None:
             self.layers[-1].bias = bias_init
         self.ks = np.array(ks)
-
+        self.proportional_ks = proportional_ks
         self.nonlin = nonlin
         self.do = nn.Dropout(dropout)
         self.device = device
         self.to(self.device)
 
     def forward(self, x):
+        """
+        x: (B, C_in, T_max) where each sample can have a different
+        effective number of tiles (others are padded and masked out).
+        """
         if self.training:
+            # Pick a base k from the configured list; per‑sample proportional
+            # scaling happens inside forward_fixed_k.
             k = int(np.random.choice(self.ks))
             return self.forward_fixed_k(x, k)
         else:
@@ -80,23 +86,81 @@ class HE2RNA(nn.Module):
             return pred
 
     def forward_fixed_k(self, x, k):
-        k = min(k, x.shape[2])
+        """
+        Aggregate per sample using (potentially) different k for each image
+        in the batch, depending on how many valid tiles it has.
+        """
+        # x: (B, C_in, T_max)
+        B, _, T_max = x.shape
+
+        # Build a binary mask of valid tiles based on the raw input.
+        # mask: (B, 1, T_max) with 1 where tile is valid.
         mask, _ = torch.max(x, dim=1, keepdim=True)
         mask = (mask > 0).float()
-        x = self.conv(x) * mask
-        t, _ = torch.topk(x, k, dim=2, largest=True, sorted=True)
-        
-        # Calculate denominator
-        denom = torch.sum(mask[:, :, :k], dim=2)
-        
-        # Check for zero denominator (empty mask)
-        if (denom == 0).any():
-            print(f"WARNING: Found slide with 0 valid tiles for k={k}. Input shape: {x.shape}")
-            # Add epsilon to avoid NaN
-            # denom = denom + 1e-6
-            
-        x = torch.sum(t * mask[:, :, :k], dim=2) / denom
-        return x
+
+        # Run the conv stack on all tiles, then mask invalid ones.
+        scores = self.conv(x) * mask  # (B, C_out, T_max)
+
+        # Count valid tiles per sample (B,)
+        valid_counts = mask.sum(dim=2).squeeze(1)  # (B,)
+        valid_counts_clamped = valid_counts.clamp(min=1)  # avoid zeros
+
+        # Clamp the base k to something sensible for this batch
+        base_k = max(1, min(int(k), T_max))
+
+        if self.proportional_ks:
+            # Interpret ks[-1] as the reference "max k" used in config.
+            # For samples with fewer valid tiles than this reference, we
+            # scale k down proportionally. For samples with at least
+            # ref_max_k valid tiles, we leave k unscaled.
+            ref_max_k = float(np.max(self.ks))
+            scale = valid_counts_clamped / ref_max_k  # (B,)
+            # Only scale when the slide has fewer tiles than ref_max_k
+            scale = torch.where(
+                valid_counts_clamped < ref_max_k,
+                scale,
+                torch.ones_like(scale),
+            )
+            k_per_sample = (base_k * scale).round().clamp(min=1).long()  # (B,)
+        else:
+            # Same k for all samples (but cannot exceed their valid counts)
+            k_per_sample = torch.full_like(valid_counts_clamped, base_k, dtype=torch.long)
+
+        # Do not request more tiles than each sample actually has
+        k_per_sample = torch.minimum(k_per_sample, valid_counts_clamped.long())  # (B,)
+
+        # Global K we need for topk across the batch
+        max_k = int(k_per_sample.max().item())
+        max_k = max(1, min(max_k, T_max))
+
+        # Take top max_k tiles per sample/channel
+        # t: (B, C_out, max_k), idx: (B, C_out, max_k)
+        t, idx = torch.topk(scores, max_k, dim=2, largest=True, sorted=True)
+
+        # Gather the validity mask at top-k indices.
+        # gather() requires the channel dimension to match idx, so expand mask
+        # from (B,1,T_max) to (B,C_out,T_max) first.
+        mask_expanded = mask.expand(-1, scores.shape[1], -1)  # (B, C_out, T_max)
+        mask_topk = mask_expanded.gather(2, idx)  # (B, C_out, max_k)
+
+        # For proportional_ks, only the first k_per_sample[i] entries in
+        # the sorted top‑k list for sample i should contribute.
+        # Build per‑sample mask over the k dimension.
+        range_k = torch.arange(max_k, device=x.device).view(1, 1, -1)  # (1,1,max_k)
+        k_expanded = k_per_sample.view(B, 1, 1)  # (B,1,1)
+        per_sample_mask = (range_k < k_expanded).float()  # (B,1,max_k)
+
+        # Combined mask over selected tiles: valid AND within per‑sample k
+        combined_mask = mask_topk * per_sample_mask  # (B,C_out,max_k)
+
+        # Numerator: sum of scores over selected tiles
+        numer = (t * combined_mask).sum(dim=2)  # (B, C_out)
+
+        # Denominator: number of selected valid tiles; clamp to avoid div‑by‑zero
+        denom = combined_mask.sum(dim=2).clamp_min(1.0)  # (B, C_out)
+
+        out = numer / denom  # (B, C_out)
+        return out
 
     def conv(self, x):
         x = x[:, x.shape[1] - self.input_dim:]
@@ -106,13 +170,22 @@ class HE2RNA(nn.Module):
         return x
 
 
+def _unpack_batch(batch):
+    if isinstance(batch, (list, tuple)):
+        if len(batch) < 2:
+            raise ValueError("Batch must contain at least (features, targets).")
+        return batch[0], batch[1]
+    raise ValueError("Unsupported batch type. Expected tuple/list.")
+
+
 def training_epoch(model, dataloader, optimizer):
     """Train model for one epoch.
     """
     model.train()
     loss_fn = nn.MSELoss()
     train_loss = []
-    for x, y in tqdm(dataloader):
+    for batch in tqdm(dataloader):
+        x, y = _unpack_batch(batch)
         # print("Shape of x: ", x.shape, "Shape of y: ", y.shape)
         # print("x: ", x[:, :5, 0])
         # print("y: ", y[:, :5])
@@ -210,7 +283,8 @@ def evaluate(model, dataloader, projects):
     valid_loss = []
     preds = []
     labels = []
-    for x, y in dataloader:
+    for batch in dataloader:
+        x, y = _unpack_batch(batch)
         pred = model(x.float().to(model.device))
         labels += [y]
         loss = loss_fn(pred, y.float().to(model.device))
@@ -230,7 +304,8 @@ def predict(model, dataloader):
     model.eval()
     labels = []
     preds = []
-    for x, y in dataloader:
+    for batch in dataloader:
+        x, y = _unpack_batch(batch)
         pred = model(x.float().to(model.device))
         labels += [y]
         pred = nn.ReLU()(pred)
@@ -248,7 +323,8 @@ def fit(model,
         optimizer=None,
         test_set=None,
         path=None,
-        logdir='./exp'):
+        logdir='./exp',
+        train_loader=None):
     """Fit the model and make prediction on evaluation set.
 
     Args:
@@ -284,8 +360,9 @@ def fit(model,
     writer = SummaryWriter(log_dir=logdir, flush_secs=30)
 
     # SET num_workers TO 0 WHEN WORKING WITH hdf5 FILES
-    train_loader = DataLoader(
-        train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    if train_loader is None:
+        train_loader = DataLoader(
+            train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
 
     if valid_set is not None:
         valid_loader = DataLoader(
@@ -320,6 +397,8 @@ def fit(model,
         for e in range(max_epochs):
 
             epoch_since_best += 1
+            if hasattr(train_loader, 'batch_sampler') and hasattr(train_loader.batch_sampler, 'set_epoch'):
+                train_loader.batch_sampler.set_epoch(e)
 
             train_loss = training_epoch(model, train_loader, optimizer)
             dic_loss = {'train_loss': train_loss}
@@ -329,6 +408,15 @@ def fit(model,
                 max_epochs,
                 time.time() - start_time))
             start_time = time.time()
+            if hasattr(train_loader, 'batch_sampler') and hasattr(train_loader.batch_sampler, 'observed_counts'):
+                counts = train_loader.batch_sampler.observed_counts
+                total_seen = counts.get('cscc', 0) + counts.get('tcga', 0)
+                if total_seen > 0:
+                    cscc_ratio = counts['cscc'] / total_seen
+                    print(
+                        f"Train domain mix this epoch: CSCC={counts['cscc']} "
+                        f"TCGA={counts['tcga']} ratio_cscc={cscc_ratio:.3f}"
+                    )
 
             if valid_set is not None:
                 valid_loss, scores = evaluate(

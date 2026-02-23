@@ -106,11 +106,13 @@ class CSCCDataset(Dataset):
                 all_rsm1_ids.append(str(sid).strip())
         print(f"  Found {len(all_rsm1_ids)} split Sample_ids in DSQUAME keyfile (flattened list)")
 
+        # TODO I comment out the DSQUAME keyfile filtering for now, until CP Score is available for all patients in the DSQUAME keyfile.
         # Keep only rows of keyfile_rsm2 that have 'sample_id' entry in all_rsm1_ids
-        keyfile_rsm2 = keyfile_rsm2[keyfile_rsm2['sample_id'].astype(str).isin(all_rsm1_ids)]
+        # keyfile_rsm2 = keyfile_rsm2[keyfile_rsm2['sample_id'].astype(str).isin(all_rsm1_ids)]
         filtered_set = set(keyfile_rsm2['sample_id'])
         print(f"  Filtered out {len(original_set - filtered_set)} patients due to missing (split) Sample_id in DSQUAME keyfile. Remaining: {len(filtered_set)}")
         print(f"  All missing Sample_ids: {original_set - filtered_set}")
+        print(f"  DSQUAME keyfile filtering commented out for now, until CP Score is available for all patients in the DSQUAME keyfile.")
 
         
         if 'rna_qc_status' in keyfile_rsm2.columns:

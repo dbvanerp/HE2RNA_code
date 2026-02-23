@@ -20,10 +20,13 @@ import os
 import configparser
 import argparse
 import pickle as pkl
+import json
+import random
 import pandas as pd
 import numpy as np
 import copy as cp
 from time import sleep
+from datetime import datetime
 from tqdm import tqdm
 import h5py
 import torch
@@ -31,12 +34,14 @@ from torch import nn
 from torch.utils.data import Subset, DataLoader
 from torch import optim
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, ShuffleSplit
 # from transcriptome_data import TranscriptomeDataset
 # from wsi_data import load_labels, AggregatedDataset, TCGAFolder, \
 #     H5Dataset, patient_split, match_patient_split, \
 #     patient_kfold, match_patient_kfold
 from CSCCDatasetClass import CSCCDataset
 from TCGADatasetClass import TCGADataset, match_patient_kfold, match_patient_single
+from mixed_dataset import MixedDataset, BalancedDomainBatchSampler
 from model import HE2RNA, fit, predict
 from utils import compute_metrics, summarize_class, save_patient_splits
 from constant import PATH_TO_TILES
@@ -98,7 +103,7 @@ class Experiment(object):
         else:
             self.subsample = None
 
-        # Data mode: 'tcga' (default) or 'cscc'
+        # Data mode: 'tcga' (default), 'cscc', or mixed mode.
         if 'data_mode' in self.config['main'].keys():
             self.data_mode = self.config['main']['data_mode'].lower()
         elif 'cscc_mode' in self.config['main'].keys() and self.config['main']['cscc_mode'] == 'True':
@@ -106,6 +111,12 @@ class Experiment(object):
             self.data_mode = 'cscc'
         else:
             self.data_mode = 'tcga'
+        supported_modes = ['tcga', 'cscc', 'mixed_cscc_tcga_anchor']
+        if self.data_mode not in supported_modes:
+            raise ValueError(f"Unsupported data_mode '{self.data_mode}'. Expected one of {supported_modes}.")
+        self.default_anchor_projects = [
+            'TCGA-HNSC', 'TCGA-LUSC', 'TCGA-CESC', 'TCGA-ESCA', 'TCGA-BLCA'
+        ]
 
         if 'p_value' in self.config['main'].keys():
             self.p_value = self.config['main']['p_value']
@@ -126,6 +137,10 @@ class Experiment(object):
             if 'dropout' in dic.keys():
                 model_params['dropout'] = float(dic['dropout'])
             if 'ks' in dic.keys():
+                if 'proportional_ks' in dic.keys() and dic['proportional_ks'].strip().lower() == 'true':
+                    model_params['proportional_ks'] = True
+                else:
+                    model_params['proportional_ks'] = False
                 ks = dic['ks'].split(',')
                 model_params['ks'] = [int(k) for k in ks]
             if 'nonlin' in dic.keys():
@@ -156,25 +171,227 @@ class Experiment(object):
 
         return training_params
 
-    def _setup_optimization(self, model):
+    def _read_bool(self, section, key, default=False):
+        if section not in self.config.sections() or key not in self.config[section].keys():
+            return default
+        return self.config[section][key].strip().lower() in ['1', 'true', 'yes', 'y']
 
+    def _read_float_list(self, section, key, default):
+        if section not in self.config.sections() or key not in self.config[section].keys():
+            return default
+        values = [x.strip() for x in self.config[section][key].split(',') if x.strip()]
+        return [float(x) for x in values]
+
+    def _set_global_seeds(self, seed):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def _get_anchor_projects(self):
+        dic = self.config['data']
+        if 'tcga_project_filter' in dic.keys():
+            raw = dic['tcga_project_filter']
+            projects = [p.strip() for p in raw.split(',') if p.strip()]
+            if len(projects) > 0:
+                return projects
+        return self.default_anchor_projects
+
+    def _setup_optimization(self, model, override_lr=None):
         if 'optimization' in self.config.sections():
             dic = self.config['optimization']
-            optim_params = {'params': model.parameters(),
-                            'lr': float(dic['lr'])}
-            if 'momentum' in self.config['optimization'].keys():
+            base_lr = float(dic['lr']) if override_lr is None else float(override_lr)
+            weight_decay = float(dic['weight_decay']) if 'weight_decay' in dic.keys() else 0.0
+            optimizer_name = dic['optimizer']
+            use_diff_lr = self._read_bool('optimization', 'differential_lr', default=False)
+
+            if use_diff_lr and hasattr(model, 'layers') and len(model.layers) > 1:
+                head_lr_mult = float(dic['head_lr_multiplier']) if 'head_lr_multiplier' in dic.keys() else 5.0
+                base_params = []
+                for layer in model.layers[:-1]:
+                    base_params += list(layer.parameters())
+                head_params = list(model.layers[-1].parameters())
+                param_groups = [
+                    {'params': base_params, 'lr': base_lr},
+                    {'params': head_params, 'lr': base_lr * head_lr_mult},
+                ]
+                print(
+                    f"Using differential LR parameter groups: base_lr={base_lr:.2e}, "
+                    f"head_lr={base_lr * head_lr_mult:.2e}"
+                )
+                if optimizer_name == 'sgd':
+                    momentum = float(dic['momentum']) if 'momentum' in dic.keys() else 0.9
+                    return optim.SGD(param_groups, momentum=momentum, nesterov=True, weight_decay=weight_decay)
+                if optimizer_name == 'adam':
+                    return optim.Adam(param_groups, weight_decay=weight_decay)
+                raise ValueError(f"Unsupported optimizer '{optimizer_name}'")
+
+            optim_params = {'params': model.parameters(), 'lr': base_lr}
+            if 'momentum' in dic.keys():
                 optim_params['momentum'] = float(dic['momentum'])
                 optim_params['nesterov'] = True
-            if 'weight_decay' in self.config['optimization'].keys():
-                optim_params['weight_decay'] = float(dic['weight_decay'])
+            if 'weight_decay' in dic.keys():
+                optim_params['weight_decay'] = weight_decay
 
-            if dic['optimizer'] == 'sgd':
+            if optimizer_name == 'sgd':
                 return optim.SGD(**optim_params)
-            elif dic['optimizer'] == 'adam':
+            if optimizer_name == 'adam':
                 return optim.Adam(**optim_params)
+            raise ValueError(f"Unsupported optimizer '{optimizer_name}'")
+        return optim.Adam(model.parameters(), lr=1e-3)
 
+    def _load_saved_model_for_fold(self, fold_idx, model_params):
+        if not self.use_saved_model:
+            return None
+        fold_path = os.path.join(self.use_saved_model, f'model_{fold_idx}', 'model.pt')
+        base_path = os.path.join(self.use_saved_model, 'model.pt')
+        model_path = fold_path if os.path.exists(fold_path) else base_path
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Saved model not found at fold path '{fold_path}' or base path '{base_path}'."
+            )
+        model = torch.load(model_path)
+        if 'ks' in model_params.keys():
+            model.ks = model_params['ks']
+        if 'top_k' in model_params.keys():
+            model.top_k = model_params['top_k']
+        if 'bottom_ks' in model_params.keys():
+            model.bottom_ks = model_params['bottom_ks']
+        if 'dropout' in model_params.keys():
+            model.do.p = model_params['dropout']
+        return model
+
+    def _initialize_model(self, model_params, train_set, fold_idx):
+        if self.use_saved_model:
+            return self._load_saved_model_for_fold(fold_idx, model_params)
+        print("Initializing model without saved model")
+        try:
+            model_params['bias_init'] = torch.nn.Parameter(
+                torch.Tensor(
+                    np.mean([sample[1] for sample in train_set], axis=0)
+                ).cuda()
+            )
+        except ValueError:
+            model_params['bias_init'] = torch.nn.Parameter(
+                torch.Tensor(
+                    np.mean([sample[1].numpy() for sample in train_set], axis=0)
+                ).cuda()
+            )
+        return HE2RNA(**model_params)
+
+    def _safe_stratified_split_indices(self, n_items, labels, test_size, random_state):
+        labels = np.asarray(labels)
+        item_indices = np.arange(n_items)
+        unique, counts = np.unique(labels, return_counts=True)
+        min_count = counts.min()
+        if min_count >= 2:
+            try:
+                sss = StratifiedShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+                train_idx, test_idx = next(sss.split(item_indices, labels))
+                return train_idx, test_idx
+            except ValueError as e:
+                print(f"Warning: stratified split failed ({e}), falling back to random split.")
         else:
-            return optim.Adam(lr=1e-3)
+            print(
+                f"Warning: class '{unique[counts.argmin()]}' has only {min_count} sample(s); "
+                "falling back to random split."
+            )
+        ss = ShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+        train_idx, test_idx = next(ss.split(item_indices))
+        return train_idx, test_idx
+
+    def _build_cscc_inner_folds(self, cscc_dataset, eligible_indices, n_splits, random_state):
+        groups, group_labels = cscc_dataset._build_sample_groups()
+        group_labels = np.asarray(group_labels)
+        eligible_studies = set(cscc_dataset.patients[eligible_indices])
+        study_to_idx = {sid: i for i, sid in enumerate(cscc_dataset.patients)}
+        filtered_groups = []
+        filtered_labels = []
+        for g, lab in zip(groups, group_labels):
+            if all(s in eligible_studies for s in g):
+                filtered_groups.append(g)
+                filtered_labels.append(lab)
+        if len(filtered_groups) < n_splits:
+            raise ValueError(
+                f"Not enough CSCC groups ({len(filtered_groups)}) for {n_splits} inner folds."
+            )
+        filtered_labels = np.asarray(filtered_labels)
+        fold_train_idx, fold_valid_idx = [], []
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+        for train_groups_idx, valid_groups_idx in skf.split(np.arange(len(filtered_groups)), filtered_labels):
+            tr = []
+            va = []
+            for gi in train_groups_idx:
+                tr.extend([study_to_idx[s] for s in filtered_groups[gi]])
+            for gi in valid_groups_idx:
+                va.extend([study_to_idx[s] for s in filtered_groups[gi]])
+            fold_train_idx.append(np.array(sorted(set(tr)), dtype=int))
+            fold_valid_idx.append(np.array(sorted(set(va)), dtype=int))
+        return fold_train_idx, fold_valid_idx
+
+    def _build_cscc_train_valid_split(self, cscc_dataset, eligible_indices, valid_size, random_state):
+        groups, group_labels = cscc_dataset._build_sample_groups()
+        group_labels = np.asarray(group_labels)
+        eligible_studies = set(cscc_dataset.patients[eligible_indices])
+        study_to_idx = {sid: i for i, sid in enumerate(cscc_dataset.patients)}
+        filtered_groups = []
+        filtered_labels = []
+        for g, lab in zip(groups, group_labels):
+            if all(s in eligible_studies for s in g):
+                filtered_groups.append(g)
+                filtered_labels.append(lab)
+        group_indices = np.arange(len(filtered_groups))
+        tr_rel, va_rel = self._safe_stratified_split_indices(
+            n_items=len(group_indices),
+            labels=np.asarray(filtered_labels),
+            test_size=valid_size,
+            random_state=random_state
+        )
+        tr = []
+        va = []
+        for gi in group_indices[tr_rel]:
+            tr.extend([study_to_idx[s] for s in filtered_groups[gi]])
+        for gi in group_indices[va_rel]:
+            va.extend([study_to_idx[s] for s in filtered_groups[gi]])
+        return np.array(sorted(set(tr)), dtype=int), np.array(sorted(set(va)), dtype=int)
+
+    def _build_mixed_train_loader(self, cscc_dataset, tcga_dataset, cscc_indices, batch_size, num_workers, seed):
+        cscc_subset = Subset(cscc_dataset, cscc_indices)
+        tcga_subset = Subset(tcga_dataset, np.arange(len(tcga_dataset)))
+        mixed_train_set = MixedDataset(cscc_subset, tcga_subset)
+        sampler = BalancedDomainBatchSampler(
+            domain_labels=mixed_train_set.domain_labels,
+            batch_size=batch_size,
+            cscc_fraction=0.5,
+            seed=seed,
+            drop_last=False
+        )
+        # Allow workers by default; only force 0 for high-risk configurations
+        # unless user explicitly overrides this behavior.
+        allow_risky_workers = self._read_bool('training', 'allow_mixed_multiworker', default=False)
+        tcga_aggregated = bool(getattr(tcga_dataset, 'aggregated', False))
+        if tcga_aggregated and not allow_risky_workers:
+            safe_num_workers = 0
+            if num_workers != 0:
+                print(
+                    f"Overriding num_workers={num_workers} to 0 for mixed mode "
+                    "because aggregated TCGA mode can duplicate large in-memory caches "
+                    "across workers. Set [training] allow_mixed_multiworker=true to override."
+                )
+        else:
+            safe_num_workers = int(num_workers)
+        return DataLoader(
+            mixed_train_set,
+            batch_sampler=sampler,
+            num_workers=safe_num_workers
+        )
+
+    def _write_run_metadata(self, log_object):
+        output_path = os.path.join(self.savedir, 'run_metadata.json')
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(log_object, f, indent=2)
+        print(f"Saved run metadata to {output_path}")
 
     def _predict_without_training(self, model, eval_set, training_params):
         batch_size = training_params.get('batch_size', 16)
@@ -252,6 +469,59 @@ class Experiment(object):
             print(f"Data mode: TCGA. Loaded from {os.path.basename(dic['path_to_data'])}, {os.path.basename(dic['path_to_transcriptome'])}, {os.path.basename(dic['keyfile_path'])}")
             
             return dataset
+
+        elif self.data_mode == 'mixed_cscc_tcga_anchor':
+            # CSCC dataset (target domain)
+            project_column = dic['project_column'] if 'project_column' in dic.keys() else 'metastasis'
+            cscc_dataset = CSCCDataset(
+                dic['path_to_data'],
+                dic['path_to_transcriptome'],
+                dic['keyfile_path'],
+                genes,
+                project_column=project_column
+            )
+
+            # TCGA anchor dataset (replay buffer domain)
+            if 'tcga_path_to_data' not in dic.keys() or 'tcga_path_to_transcriptome' not in dic.keys() or 'tcga_keyfile_path' not in dic.keys():
+                raise ValueError(
+                    "Mixed mode requires tcga_path_to_data, tcga_path_to_transcriptome and tcga_keyfile_path in [data]."
+                )
+            tcga_projects = self._get_anchor_projects()
+            tcga_path_to_data = dic['tcga_path_to_data']
+            if os.path.isdir(tcga_path_to_data):
+                tcga_dataset = TCGADataset(
+                    targets_csv=dic['tcga_path_to_transcriptome'],
+                    keyfile_path=dic['tcga_keyfile_path'],
+                    features_dir=tcga_path_to_data,
+                    genes=genes,
+                    project_filter=tcga_projects,
+                    max_tiles=8000
+                )
+            elif tcga_path_to_data.endswith('.h5'):
+                tcga_dataset = TCGADataset(
+                    targets_csv=dic['tcga_path_to_transcriptome'],
+                    keyfile_path=dic['tcga_keyfile_path'],
+                    features_aggregated=tcga_path_to_data,
+                    genes=genes,
+                    project_filter=tcga_projects,
+                    max_tiles=100
+                )
+            else:
+                raise ValueError(f"Unsupported tcga_path_to_data format: {tcga_path_to_data}")
+
+            mixed_dataset = MixedDataset(cscc_dataset, tcga_dataset)
+            print(
+                "Data mode: mixed_cscc_tcga_anchor\n"
+                f"CSCC samples: {len(cscc_dataset)} | "
+                f"TCGA anchor samples: {len(tcga_dataset)} | "
+                f"Anchor projects: {tcga_projects}"
+            )
+            return {
+                'cscc_dataset': cscc_dataset,
+                'tcga_dataset': tcga_dataset,
+                'mixed_dataset': mixed_dataset,
+                'anchor_projects': tcga_projects,
+            }
 
         print("WARNING: IF THIS PRINTS, YOU ARE BACK TO WSI_DATA AND TRANSCRIPTOME_DATA INSTEAD OF THE BEAUTIFUL SHINY NEW TCGADataset/CSCCDataset")    
         
@@ -374,6 +644,306 @@ class Experiment(object):
 
         return dataset
 
+    def _cross_validation_mixed_outer(self, n_folds=5, random_state=0, logdir='exp'):
+        model_params = self._read_architecture()
+        training_params = self._read_training_params()
+        data_bundle = self._build_dataset()
+        cscc_dataset = data_bundle['cscc_dataset']
+        tcga_dataset = data_bundle['tcga_dataset']
+        anchor_projects = data_bundle['anchor_projects']
+        model_params['input_dim'] = data_bundle['mixed_dataset'].dim
+        model_params['output_dim'] = len(data_bundle['mixed_dataset'].genes)
+
+        valid_size = 0.1 if 'patience' in training_params.keys() else 0
+        train_idx, valid_idx, test_idx = cscc_dataset.stratified_kfold(
+            n_splits=n_folds, valid_size=valid_size, random_state=random_state
+        )
+
+        report = {'gene': list(cscc_dataset.genes)}
+        full_preds = np.zeros((len(cscc_dataset), model_params['output_dim']))
+        full_labels = np.zeros((len(cscc_dataset), model_params['output_dim']))
+        visited_mask = np.zeros(len(cscc_dataset), dtype=bool)
+
+        train_patients_list = []
+        valid_patients_list = []
+        test_patients_list = []
+        metadata = {
+            'mode': 'mixed_cscc_tcga_anchor',
+            'phase': 'outer_cv',
+            'date_time': datetime.now().isoformat(),
+            'anchor_projects': anchor_projects,
+            'folds': []
+        }
+
+        for k in range(n_folds):
+            print(f"Running mixed outer fold {k}...")
+            fold_logdir = os.path.join(logdir, f'fold_{k}')
+            os.makedirs(fold_logdir, exist_ok=True)
+            self._set_global_seeds(random_state + k)
+
+            train_set_cscc = Subset(cscc_dataset, train_idx[k])
+            valid_set = Subset(cscc_dataset, valid_idx[k]) if len(valid_idx[k]) > 0 else None
+            test_set = Subset(cscc_dataset, test_idx[k])
+
+            tr_set = set(train_idx[k])
+            va_set = set(valid_idx[k])
+            te_set = set(test_idx[k])
+            assert len(tr_set & va_set) == 0, f"Fold {k}: train/valid overlap"
+            assert len(tr_set & te_set) == 0, f"Fold {k}: train/test overlap"
+            assert len(va_set & te_set) == 0, f"Fold {k}: valid/test overlap"
+
+            train_loader = self._build_mixed_train_loader(
+                cscc_dataset=cscc_dataset,
+                tcga_dataset=tcga_dataset,
+                cscc_indices=train_idx[k],
+                batch_size=training_params.get('batch_size', 16),
+                num_workers=training_params.get('num_workers', 0),
+                seed=random_state + k,
+            )
+
+            if valid_set is not None:
+                valid_projects = cscc_dataset.projects.iloc[valid_idx[k]]
+                valid_projects = valid_projects.astype('category').cat.codes.values.astype('int64')
+            else:
+                valid_projects = None
+
+            test_projects = np.array([str(x).replace('_', '-') for x in cscc_dataset.projects.iloc[test_idx[k]].values])
+
+            model = self._initialize_model(cp.deepcopy(model_params), train_set_cscc, k)
+            if self.null_run:
+                preds, labels = self._predict_without_training(model, test_set, training_params)
+                fold_path = os.path.join(self.savedir, 'model_' + str(k))
+                os.makedirs(fold_path, exist_ok=True)
+                torch.save(model, os.path.join(fold_path, 'model.pt'))
+            else:
+                optimizer = self._setup_optimization(model)
+                preds, labels = fit(
+                    model,
+                    train_set_cscc,
+                    valid_set,
+                    valid_projects,
+                    test_set=test_set,
+                    params=training_params,
+                    optimizer=optimizer,
+                    logdir=fold_logdir,
+                    path=os.path.join(self.savedir, 'model_' + str(k)),
+                    train_loader=train_loader
+                )
+
+            full_preds[test_idx[k]] = preds
+            full_labels[test_idx[k]] = labels
+            visited_mask[test_idx[k]] = True
+
+            for project in np.unique(test_projects):
+                pred = preds[test_projects == project]
+                label = labels[test_projects == project]
+                report['correlation_' + project + '_fold_' + str(k)] = compute_metrics(label, pred)
+
+            train_patients_fold = cscc_dataset.patients[train_idx[k]]
+            valid_patients_fold = cscc_dataset.patients[valid_idx[k]] if valid_set is not None else np.array([], dtype=object)
+            test_patients_fold = cscc_dataset.patients[test_idx[k]]
+            train_patients_list.append(np.array(train_patients_fold))
+            valid_patients_list.append(np.array(valid_patients_fold))
+            test_patients_list.append(np.array(test_patients_fold))
+
+            metadata['folds'].append({
+                'fold': k,
+                'n_train_cscc': int(len(train_idx[k])),
+                'n_valid_cscc': int(len(valid_idx[k])),
+                'n_test_cscc': int(len(test_idx[k])),
+                'n_anchor_tcga': int(len(tcga_dataset)),
+            })
+
+        splits_output_path = os.path.join(self.savedir, 'uni_patient_splits_rs0.pkl')
+        save_patient_splits(train_patients_list, valid_patients_list, test_patients_list, splits_output_path)
+
+        pct_visited = visited_mask.mean() * 100
+        print(f"Visited {pct_visited:.2f}% of CSCC patients during cross-validation.")
+        all_projects = np.array([str(x).replace('_', '-') for x in cscc_dataset.projects.values])
+        unique_projects = np.unique(all_projects)
+        report_whole_dataset = {'gene': list(cscc_dataset.genes)}
+        for project in unique_projects:
+            pred = full_preds[all_projects == project]
+            label = full_labels[all_projects == project]
+            report_whole_dataset['correlation_' + project] = compute_metrics(label, pred)
+
+        report = pd.DataFrame(report)
+        report_whole_dataset = pd.DataFrame(report_whole_dataset)
+        filename = 'results_per_fold_null.csv' if self.null_run else 'results_per_fold.csv'
+        filename_whole_dataset = 'results_whole_dataset_null.csv' if self.null_run else 'results_whole_dataset.csv'
+        report.to_csv(os.path.join(self.savedir, filename), index=False)
+        report_whole_dataset.to_csv(os.path.join(self.savedir, filename_whole_dataset), index=False)
+        self._write_run_metadata(metadata)
+        return report, report_whole_dataset
+
+    def _cross_validation_mixed_nested(self, n_folds=5, random_state=0, logdir='exp'):
+        model_params = self._read_architecture()
+        training_params = self._read_training_params()
+        data_bundle = self._build_dataset()
+        cscc_dataset = data_bundle['cscc_dataset']
+        tcga_dataset = data_bundle['tcga_dataset']
+        anchor_projects = data_bundle['anchor_projects']
+        model_params['input_dim'] = data_bundle['mixed_dataset'].dim
+        model_params['output_dim'] = len(data_bundle['mixed_dataset'].genes)
+
+        inner_folds = int(self.config['training']['inner_folds']) if 'training' in self.config.sections() and 'inner_folds' in self.config['training'].keys() else 3
+        lr_candidates = self._read_float_list(
+            section='optimization',
+            key='nested_lr_candidates',
+            default=[float(self.config['optimization']['lr'])] if 'optimization' in self.config.sections() and 'lr' in self.config['optimization'].keys() else [1e-3]
+        )
+
+        outer_train_idx, _, outer_test_idx = cscc_dataset.stratified_kfold(
+            n_splits=n_folds, valid_size=0.0, random_state=random_state
+        )
+
+        report = {'gene': list(cscc_dataset.genes)}
+        full_preds = np.zeros((len(cscc_dataset), model_params['output_dim']))
+        full_labels = np.zeros((len(cscc_dataset), model_params['output_dim']))
+        visited_mask = np.zeros(len(cscc_dataset), dtype=bool)
+        metadata = {
+            'mode': 'mixed_cscc_tcga_anchor',
+            'phase': 'nested_cv',
+            'date_time': datetime.now().isoformat(),
+            'anchor_projects': anchor_projects,
+            'inner_folds': inner_folds,
+            'lr_candidates': lr_candidates,
+            'folds': []
+        }
+
+        for k in range(n_folds):
+            print(f"Running nested outer fold {k}...")
+            self._set_global_seeds(random_state + k)
+            pool_idx = outer_train_idx[k]
+            test_idx = outer_test_idx[k]
+            test_set = Subset(cscc_dataset, test_idx)
+
+            inner_train_idx, inner_valid_idx = self._build_cscc_inner_folds(
+                cscc_dataset=cscc_dataset,
+                eligible_indices=pool_idx,
+                n_splits=inner_folds,
+                random_state=random_state + k
+            )
+
+            candidate_scores = []
+            for cand_lr in lr_candidates:
+                fold_scores = []
+                for j in range(inner_folds):
+                    fold_logdir = os.path.join(logdir, f'outer_{k}_inner_{j}_lr_{cand_lr}')
+                    os.makedirs(fold_logdir, exist_ok=True)
+                    train_loader = self._build_mixed_train_loader(
+                        cscc_dataset=cscc_dataset,
+                        tcga_dataset=tcga_dataset,
+                        cscc_indices=inner_train_idx[j],
+                        batch_size=training_params.get('batch_size', 16),
+                        num_workers=training_params.get('num_workers', 0),
+                        seed=random_state + k * 100 + j,
+                    )
+                    train_set_cscc = Subset(cscc_dataset, inner_train_idx[j])
+                    valid_set_inner = Subset(cscc_dataset, inner_valid_idx[j])
+                    valid_projects_inner = cscc_dataset.projects.iloc[inner_valid_idx[j]]
+                    valid_projects_inner = valid_projects_inner.astype('category').cat.codes.values.astype('int64')
+
+                    model = self._initialize_model(cp.deepcopy(model_params), train_set_cscc, k)
+                    optimizer = self._setup_optimization(model, override_lr=cand_lr)
+                    preds_inner, labels_inner = fit(
+                        model,
+                        train_set_cscc,
+                        valid_set_inner,
+                        valid_projects_inner,
+                        test_set=valid_set_inner,
+                        params=training_params,
+                        optimizer=optimizer,
+                        logdir=fold_logdir,
+                        path=None,
+                        train_loader=train_loader
+                    )
+                    corr_values = np.asarray(compute_metrics(labels_inner, preds_inner), dtype=float)
+                    fold_scores.append(float(np.nanmean(corr_values)))
+                candidate_scores.append(float(np.nanmean(fold_scores)))
+                print(f"Outer fold {k} candidate lr={cand_lr:.2e} mean inner score={candidate_scores[-1]:.4f}")
+
+            best_idx = int(np.nanargmax(candidate_scores))
+            best_lr = float(lr_candidates[best_idx])
+            valid_size = 0.1 if 'patience' in training_params.keys() else 0
+            if valid_size > 0:
+                retrain_train_idx, retrain_valid_idx = self._build_cscc_train_valid_split(
+                    cscc_dataset=cscc_dataset,
+                    eligible_indices=pool_idx,
+                    valid_size=valid_size,
+                    random_state=random_state + k
+                )
+                valid_set = Subset(cscc_dataset, retrain_valid_idx)
+                valid_projects = cscc_dataset.projects.iloc[retrain_valid_idx]
+                valid_projects = valid_projects.astype('category').cat.codes.values.astype('int64')
+            else:
+                retrain_train_idx = np.array(pool_idx, dtype=int)
+                retrain_valid_idx = np.array([], dtype=int)
+                valid_set = None
+                valid_projects = None
+
+            train_loader = self._build_mixed_train_loader(
+                cscc_dataset=cscc_dataset,
+                tcga_dataset=tcga_dataset,
+                cscc_indices=retrain_train_idx,
+                batch_size=training_params.get('batch_size', 16),
+                num_workers=training_params.get('num_workers', 0),
+                seed=random_state + k
+            )
+            train_set_cscc = Subset(cscc_dataset, retrain_train_idx)
+            model = self._initialize_model(cp.deepcopy(model_params), train_set_cscc, k)
+            optimizer = self._setup_optimization(model, override_lr=best_lr)
+            fold_logdir = os.path.join(logdir, f'outer_fold_{k}')
+            os.makedirs(fold_logdir, exist_ok=True)
+            preds, labels = fit(
+                model,
+                train_set_cscc,
+                valid_set,
+                valid_projects,
+                test_set=test_set,
+                params=training_params,
+                optimizer=optimizer,
+                logdir=fold_logdir,
+                path=os.path.join(self.savedir, 'model_' + str(k)),
+                train_loader=train_loader
+            )
+
+            full_preds[test_idx] = preds
+            full_labels[test_idx] = labels
+            visited_mask[test_idx] = True
+            test_projects = np.array([str(x).replace('_', '-') for x in cscc_dataset.projects.iloc[test_idx].values])
+            for project in np.unique(test_projects):
+                pred = preds[test_projects == project]
+                label = labels[test_projects == project]
+                report['correlation_' + project + '_fold_' + str(k)] = compute_metrics(label, pred)
+
+            metadata['folds'].append({
+                'fold': k,
+                'best_lr': best_lr,
+                'candidate_scores': candidate_scores,
+                'n_train_cscc': int(len(retrain_train_idx)),
+                'n_valid_cscc': int(len(retrain_valid_idx)),
+                'n_test_cscc': int(len(test_idx)),
+                'n_anchor_tcga': int(len(tcga_dataset)),
+            })
+
+        pct_visited = visited_mask.mean() * 100
+        print(f"Visited {pct_visited:.2f}% of CSCC patients during nested CV.")
+        all_projects = np.array([str(x).replace('_', '-') for x in cscc_dataset.projects.values])
+        unique_projects = np.unique(all_projects)
+        report_whole_dataset = {'gene': list(cscc_dataset.genes)}
+        for project in unique_projects:
+            pred = full_preds[all_projects == project]
+            label = full_labels[all_projects == project]
+            report_whole_dataset['correlation_' + project] = compute_metrics(label, pred)
+
+        report = pd.DataFrame(report)
+        report_whole_dataset = pd.DataFrame(report_whole_dataset)
+        report.to_csv(os.path.join(self.savedir, 'results_per_fold_nested.csv'), index=False)
+        report_whole_dataset.to_csv(os.path.join(self.savedir, 'results_whole_dataset_nested.csv'), index=False)
+        self._write_run_metadata(metadata)
+        return report, report_whole_dataset
+
     def single_run(self, random_state=0, logdir='./exp'):
         """Experiment with a single train/test split.
 
@@ -388,6 +958,10 @@ class Experiment(object):
         model_params = self._read_architecture()
         training_params = self._read_training_params()
         dataset = self._build_dataset()
+        if self.data_mode == 'mixed_cscc_tcga_anchor':
+            raise NotImplementedError(
+                "single_run is not implemented for mixed mode. Use --run cross_validation."
+            )
         evalset = dataset
         print(f"Single run dataset after _build_dataset():")
         summarize_class(dataset)
@@ -508,6 +1082,11 @@ class Experiment(object):
         Returns:
             pandas DataFrame: The metrics per gene and per fold.
         """
+        if self.data_mode == 'mixed_cscc_tcga_anchor':
+            use_nested = self._read_bool('training', 'nested_cv', default=False)
+            if use_nested:
+                return self._cross_validation_mixed_nested(n_folds=n_folds, random_state=random_state, logdir=logdir)
+            return self._cross_validation_mixed_outer(n_folds=n_folds, random_state=random_state, logdir=logdir)
 
         model_params = self._read_architecture()
         training_params = self._read_training_params()
@@ -623,6 +1202,7 @@ class Experiment(object):
             train_patients_list.append(train_patients_fold)
             test_patients_list.append(test_patients_fold)
             
+            valid_patients_fold = np.array([], dtype=object)
             if valid_set is not None:
                 valid_patients_fold = dataset.patients[valid_idx[k]].values if hasattr(dataset.patients, 'values') else np.array(dataset.patients[valid_idx[k]])
                 valid_patients_list.append(valid_patients_fold)
