@@ -260,6 +260,10 @@ class Experiment(object):
             model.bottom_ks = model_params['bottom_ks']
         if 'dropout' in model_params.keys():
             model.do.p = model_params['dropout']
+        if 'proportional_ks' in model_params.keys():
+            model.proportional_ks = model_params['proportional_ks']
+        else:
+            model.proportional_ks = False
         return model
 
     def _initialize_model(self, model_params, train_set, fold_idx):
@@ -1025,6 +1029,10 @@ class Experiment(object):
                 model.bottom_ks = model_params['bottom_ks']
             if 'dropout' in model_params.keys():
                 model.do.p = model_params['dropout']
+            if 'proportional_ks' in model_params.keys():
+                model.proportional_ks = model_params['proportional_ks']
+            else:
+                model.proportional_ks = False
 
         else:
             print("Initializing model without saved model")
@@ -1225,6 +1233,10 @@ class Experiment(object):
                     model.bottom_ks = model_params['bottom_ks']
                 if 'dropout' in model_params.keys():
                     model.do.p = model_params['dropout']
+                if 'proportional_ks' in model_params.keys():
+                    model.proportional_ks = model_params['proportional_ks']
+                else:
+                    model.proportional_ks = False
 
             else:
                 # Initialize bias of the last layer with the average target value on the train set
