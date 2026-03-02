@@ -27,6 +27,65 @@ from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
 
+def pearson_correlation_loss(pred, target, eps=1e-8):
+    """
+    Compute Pearson correlation loss: (1 - PearsonCorr(pred, target)).
+    This is differentiable and can be used as a loss term.
+    
+    Args:
+        pred: predictions tensor of shape (batch_size, n_genes)
+        target: target tensor of shape (batch_size, n_genes)
+        eps: small epsilon for numerical stability
+        
+    Returns:
+        loss: scalar tensor, mean of (1 - correlation) across genes
+    """
+    # Compute mean and std for each gene (across batch dimension)
+    pred_mean = pred.mean(dim=0, keepdim=True)
+    target_mean = target.mean(dim=0, keepdim=True)
+    
+    pred_centered = pred - pred_mean
+    target_centered = target - target_mean
+    
+    pred_std = torch.sqrt((pred_centered ** 2).mean(dim=0) + eps)
+    target_std = torch.sqrt((target_centered ** 2).mean(dim=0) + eps)
+    
+    # Compute covariance
+    covariance = (pred_centered * target_centered).mean(dim=0)
+    
+    # Compute correlation (per gene)
+    correlation = covariance / (pred_std * target_std + eps)
+    
+    # Return mean of (1 - correlation) across all genes
+    # We want to maximize correlation, so we minimize (1 - correlation)
+    loss = (1.0 - correlation).mean()
+    return loss
+
+
+def combined_loss(pred, target, mse_weight=1.0, corr_weight=1.0, use_relu=False):
+    """
+    Combined MSE + Pearson Correlation loss.
+    
+    Args:
+        pred: predictions tensor
+        target: target tensor
+        mse_weight: weight for MSE component
+        corr_weight: weight for correlation loss component
+        use_relu: whether to apply ReLU to predictions before computing loss
+        
+    Returns:
+        total_loss, mse_component, corr_component
+    """
+    if use_relu:
+        pred = nn.ReLU()(pred)
+    
+    mse = nn.MSELoss()(pred, target)
+    corr_loss = pearson_correlation_loss(pred, target)
+    
+    total_loss = mse_weight * mse + corr_weight * corr_loss
+    return total_loss, mse, corr_loss
+
+
 class HE2RNA(nn.Module):
     """Model that generates one score per tile and per predicted gene.
 
@@ -178,28 +237,54 @@ def _unpack_batch(batch):
     raise ValueError("Unsupported batch type. Expected tuple/list.")
 
 
-def training_epoch(model, dataloader, optimizer):
+def training_epoch(model, dataloader, optimizer, 
+                   loss_mode='mse', mse_weight=1.0, corr_weight=1.0):
     """Train model for one epoch.
+    
+    Args:
+        model: the HE2RNA model
+        dataloader: training data loader
+        optimizer: optimizer
+        loss_mode: 'mse' for pure MSE, 'combined' for MSE + Pearson Correlation
+        mse_weight: weight for MSE component (used in combined mode)
+        corr_weight: weight for correlation loss component (used in combined mode)
     """
     model.train()
-    loss_fn = nn.MSELoss()
     train_loss = []
+    train_mse = []
+    train_corr_loss = []
+    
     for batch in tqdm(dataloader):
         x, y = _unpack_batch(batch)
-        # print("Shape of x: ", x.shape, "Shape of y: ", y.shape)
-        # print("x: ", x[:, :5, 0])
-        # print("y: ", y[:, :5])
         x = x.float().to(model.device)
         y = y.float().to(model.device)
-        pred = model(x)
-        loss = loss_fn(pred, y)
-        train_loss += [loss.detach().cpu().numpy()]
+        
+        # ReLU activation matching inference (evaluate) function
+        pred = nn.ReLU()(model(x))
+        
+        if loss_mode == 'combined':
+            loss, mse, corr_loss = combined_loss(
+                pred, y, 
+                mse_weight=mse_weight, 
+                corr_weight=corr_weight
+            )
+            train_mse.append(mse.detach().cpu().numpy())
+            train_corr_loss.append(corr_loss.detach().cpu().numpy())
+        else:
+            # Pure MSE mode (original behavior)
+            loss = nn.MSELoss()(pred, y)
+        
+        train_loss.append(loss.detach().cpu().numpy())
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-    # exit()
-    train_loss = np.mean(train_loss)
-    return train_loss
+    
+    results = {'total': float(np.mean(train_loss))}
+    if loss_mode == 'combined':
+        results['mse'] = float(np.mean(train_mse))
+        results['corr_loss'] = float(np.mean(train_corr_loss))
+    
+    return results
 
 def compute_correlations_old(labels, preds, projects):
     metrics = []
@@ -324,7 +409,10 @@ def fit(model,
         test_set=None,
         path=None,
         logdir='./exp',
-        train_loader=None):
+        train_loader=None,
+        loss_mode='mse',
+        mse_weight=1.0,
+        corr_weight=1.0):
     """Fit the model and make prediction on evaluation set.
 
     Args:
@@ -341,6 +429,9 @@ def fit(model,
             predictions on the validation set.
         path (str): Path to the folder where th model will be saved.
         logdir (str): Path for TensoboardX.
+        loss_mode (str): 'mse' for pure MSE, 'combined' for MSE + Pearson Correlation
+        mse_weight (float): Weight for MSE component in combined loss
+        corr_weight (float): Weight for correlation loss component
     """
 
     if path is not None and not os.path.exists(path):
@@ -400,8 +491,24 @@ def fit(model,
             if hasattr(train_loader, 'batch_sampler') and hasattr(train_loader.batch_sampler, 'set_epoch'):
                 train_loader.batch_sampler.set_epoch(e)
 
-            train_loss = training_epoch(model, train_loader, optimizer)
-            dic_loss = {'train_loss': train_loss}
+            train_results = training_epoch(
+                model, train_loader, optimizer,
+                loss_mode=loss_mode,
+                mse_weight=mse_weight,
+                corr_weight=corr_weight
+            )
+            
+            # Handle both dict and scalar returns for backward compatibility
+            if isinstance(train_results, dict):
+                train_loss = train_results['total']
+                dic_loss = {'train_loss': train_loss}
+                if 'mse' in train_results:
+                    dic_loss['train_mse'] = train_results['mse']
+                if 'corr_loss' in train_results:
+                    dic_loss['train_corr_loss'] = train_results['corr_loss']
+            else:
+                train_loss = train_results
+                dic_loss = {'train_loss': train_loss}
 
             print('Epoch {}/{} - {:.2f}s'.format(
                 e + 1,
@@ -428,15 +535,28 @@ def fit(model,
                                    dic_loss,
                                    e)
                 writer.add_scalar('data/metrics', score, e)
-                print('loss: {:.4f}, val loss: {:.4f}'.format(
-                    train_loss,
-                    valid_loss))
+                if loss_mode == 'combined' and 'train_mse' in dic_loss:
+                    print('loss: {:.4f} (mse={:.4f}, corr_loss={:.4f}), val loss: {:.4f}'.format(
+                        train_loss,
+                        dic_loss['train_mse'],
+                        dic_loss['train_corr_loss'],
+                        valid_loss))
+                else:
+                    print('loss: {:.4f}, val loss: {:.4f}'.format(
+                        train_loss,
+                        valid_loss))
                 print('{}: {:.3f}'.format(metrics, score))
             else:
                 writer.add_scalars('data/losses',
                                    dic_loss,
                                    e)
-                print('loss: {:.4f}'.format(train_loss))
+                if loss_mode == 'combined' and 'train_mse' in dic_loss:
+                    print('loss: {:.4f} (mse={:.4f}, corr_loss={:.4f})'.format(
+                        train_loss,
+                        dic_loss['train_mse'],
+                        dic_loss['train_corr_loss']))
+                else:
+                    print('loss: {:.4f}'.format(train_loss))
 
             if valid_set is not None:
                 criterion = (score > best)

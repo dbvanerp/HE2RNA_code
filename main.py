@@ -48,7 +48,7 @@ from constant import PATH_TO_TILES
 
 
 class Experiment(object):
-    """An class that uses a config file to setup and run a gene expression
+    """A class that uses a config file to setup and run a gene expression
     prediction experiment.
 
     Args:
@@ -170,6 +170,19 @@ class Experiment(object):
                 training_params['num_workers'] = int(dic['num_workers'])
 
         return training_params
+
+    def _read_loss_params(self):
+        """Read loss function parameters from config."""
+        loss_params = {}
+        if 'loss' in self.config.sections():
+            dic = self.config['loss']
+            if 'loss_mode' in dic.keys():
+                loss_params['loss_mode'] = dic['loss_mode']
+            if 'mse_weight' in dic.keys():
+                loss_params['mse_weight'] = float(dic['mse_weight'])
+            if 'corr_weight' in dic.keys():
+                loss_params['corr_weight'] = float(dic['corr_weight'])
+        return loss_params
 
     def _read_bool(self, section, key, default=False):
         if section not in self.config.sections() or key not in self.config[section].keys():
@@ -721,6 +734,7 @@ class Experiment(object):
                 torch.save(model, os.path.join(fold_path, 'model.pt'))
             else:
                 optimizer = self._setup_optimization(model)
+                loss_params = self._read_loss_params()
                 preds, labels = fit(
                     model,
                     train_set_cscc,
@@ -731,7 +745,8 @@ class Experiment(object):
                     optimizer=optimizer,
                     logdir=fold_logdir,
                     path=os.path.join(self.savedir, 'model_' + str(k)),
-                    train_loader=train_loader
+                    train_loader=train_loader,
+                    **loss_params
                 )
 
             full_preds[test_idx[k]] = preds
@@ -850,6 +865,7 @@ class Experiment(object):
 
                     model = self._initialize_model(cp.deepcopy(model_params), train_set_cscc, k)
                     optimizer = self._setup_optimization(model, override_lr=cand_lr)
+                    loss_params = self._read_loss_params()
                     preds_inner, labels_inner = fit(
                         model,
                         train_set_cscc,
@@ -860,7 +876,8 @@ class Experiment(object):
                         optimizer=optimizer,
                         logdir=fold_logdir,
                         path=None,
-                        train_loader=train_loader
+                        train_loader=train_loader,
+                        **loss_params
                     )
                     corr_values = np.asarray(compute_metrics(labels_inner, preds_inner), dtype=float)
                     fold_scores.append(float(np.nanmean(corr_values)))
@@ -899,6 +916,7 @@ class Experiment(object):
             optimizer = self._setup_optimization(model, override_lr=best_lr)
             fold_logdir = os.path.join(logdir, f'outer_fold_{k}')
             os.makedirs(fold_logdir, exist_ok=True)
+            loss_params = self._read_loss_params()
             preds, labels = fit(
                 model,
                 train_set_cscc,
@@ -909,7 +927,8 @@ class Experiment(object):
                 optimizer=optimizer,
                 logdir=fold_logdir,
                 path=os.path.join(self.savedir, 'model_' + str(k)),
-                train_loader=train_loader
+                train_loader=train_loader,
+                **loss_params
             )
 
             full_preds[test_idx] = preds
@@ -1056,6 +1075,7 @@ class Experiment(object):
             torch.save(model, os.path.join(self.savedir, 'model_null.pt'))
         else:
             optimizer = self._setup_optimization(model)
+            loss_params = self._read_loss_params()
             preds, labels = fit(model,
                                 train_set,
                                 valid_set,
@@ -1064,7 +1084,8 @@ class Experiment(object):
                                 params=training_params,
                                 optimizer=optimizer,
                                 logdir=logdir,
-                                path=self.savedir)
+                                path=self.savedir,
+                                **loss_params)
 
         report = {'gene': list(dataset.genes)}
 
@@ -1262,6 +1283,7 @@ class Experiment(object):
                 torch.save(model, os.path.join(fold_path, 'model.pt'))
             else:
                 optimizer = self._setup_optimization(model)
+                loss_params = self._read_loss_params()
 
                 # Train model
                 preds, labels = fit(model,
@@ -1274,7 +1296,8 @@ class Experiment(object):
                                     logdir=fold_logdir,
                                     path=os.path.join(
                                         self.savedir,
-                                        'model_' + str(k)))
+                                        'model_' + str(k)),
+                                    **loss_params)
             
             current_indices = test_idx[k]
             full_preds[current_indices] = preds
