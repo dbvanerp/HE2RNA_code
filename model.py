@@ -76,8 +76,9 @@ def combined_loss(pred, target, mse_weight=1.0, corr_weight=1.0, use_relu=False)
     Returns:
         total_loss, mse_component, corr_component
     """
-    if use_relu:
-        pred = nn.ReLU()(pred)
+    # ReLU is already applied in the forward pass
+    # if use_relu:
+    #     pred = nn.ReLU()(pred)
     
     mse = nn.MSELoss()(pred, target)
     corr_loss = pearson_correlation_loss(pred, target)
@@ -138,11 +139,67 @@ class HE2RNA(nn.Module):
             # scaling happens inside forward_fixed_k.
             k = int(np.random.choice(self.ks))
             return self.forward_fixed_k(x, k)
-        else:
-            pred = 0
+        else:  # EVALUATION MODE - Vectorized
+            # 1. Compute scores exactly ONCE
+            B, _, T_max = x.shape
+            mask, _ = torch.max(x, dim=1, keepdim=True)
+            mask = (mask > 0).float()
+            scores = self.conv(x) * mask  # (B, C_out, T_max)
+            valid_counts_clamped = mask.sum(dim=2).squeeze(1).clamp(min=1)
+
+            # 2. Sort the scores ONCE (descending)
+            # sorted_scores: (B, C_out, T_max)
+            sorted_scores, _ = torch.sort(scores, dim=2, descending=True)
+
+            pred_sum = 0
+            ref_max_k = float(np.max(self.ks))
+
+            # 3. Slice for each k
             for k in self.ks:
-                pred += self.forward_fixed_k(x, int(k)) / len(self.ks)
-            return pred
+                base_k = max(1, min(int(k), T_max))
+
+                if self.proportional_ks:
+                    # Calculate proportional k per sample
+                    scale = valid_counts_clamped / ref_max_k  # (B,)
+                    # Only scale when the slide has fewer tiles than ref_max_k
+                    scale = torch.where(
+                        valid_counts_clamped < ref_max_k,
+                        scale,
+                        torch.ones_like(scale),
+                    )
+                    k_per_sample = (base_k * scale).round().clamp(min=1).long()  # (B,)
+                else:
+                    # Same k for all samples (but cannot exceed their valid counts)
+                    k_per_sample = torch.full_like(valid_counts_clamped, base_k, dtype=torch.long)
+
+                # Do not request more tiles than each sample actually has
+                k_per_sample = torch.minimum(k_per_sample, valid_counts_clamped.long())  # (B,)
+
+                # For each sample, gather the top k_per_sample scores from sorted_scores
+                # Since sorted_scores is already sorted descending, we can use a mask approach
+                # or gather with indices. Using gather with indices is more efficient for
+                # variable-length slices.
+
+                # Create indices for gathering: for each sample, indices 0 to k_per_sample[i]-1
+                max_k_for_gather = int(k_per_sample.max().item())
+                max_k_for_gather = max(1, min(max_k_for_gather, T_max))
+
+                # Take the top max_k_for_gather from sorted_scores (already sorted)
+                top_k_scores = sorted_scores[:, :, :max_k_for_gather]  # (B, C_out, max_k_for_gather)
+
+                # Build a mask to zero out positions >= k_per_sample for each sample
+                range_k = torch.arange(max_k_for_gather, device=x.device).view(1, 1, -1)  # (1, 1, max_k_for_gather)
+                k_per_sample_expanded = k_per_sample.view(B, 1, 1)  # (B, 1, 1)
+                topk_mask = (range_k < k_per_sample_expanded).float()  # (B, 1, max_k_for_gather)
+
+                # Apply mask and compute mean
+                masked_scores = top_k_scores * topk_mask  # (B, C_out, max_k_for_gather)
+                numer = masked_scores.sum(dim=2)  # (B, C_out)
+                denom = k_per_sample.unsqueeze(1).float().clamp(min=1.0)  # (B, 1)
+                pred_sum += numer / denom
+
+            final_pred = pred_sum / len(self.ks)
+            return nn.ReLU()(final_pred)
 
     def forward_fixed_k(self, x, k):
         """
@@ -259,8 +316,9 @@ def training_epoch(model, dataloader, optimizer,
         x = x.float().to(model.device)
         y = y.float().to(model.device)
         
+        # new: ReLU activation is already applied in the forward pass
         # ReLU activation matching inference (evaluate) function
-        pred = nn.ReLU()(model(x))
+        # pred = nn.ReLU()(model(x))
         
         if loss_mode == 'combined':
             loss, mse, corr_loss = combined_loss(
@@ -271,7 +329,7 @@ def training_epoch(model, dataloader, optimizer,
             train_mse.append(mse.detach().cpu().numpy())
             train_corr_loss.append(corr_loss.detach().cpu().numpy())
         else:
-            # Pure MSE mode (original behavior)
+            # Pure MSE mode (original behavior) 
             loss = nn.MSELoss()(pred, y)
         
         train_loss.append(loss.detach().cpu().numpy())
@@ -374,7 +432,8 @@ def evaluate(model, dataloader, projects):
         labels += [y]
         loss = loss_fn(pred, y.float().to(model.device))
         valid_loss += [loss.detach().cpu().numpy()]
-        pred = nn.ReLU()(pred)
+        # new: ReLU activation is already applied in the forward pass
+        # pred = nn.ReLU()(pred)
         preds += [pred.detach().cpu().numpy()]
     valid_loss = np.mean(valid_loss)
     preds = np.concatenate(preds)
