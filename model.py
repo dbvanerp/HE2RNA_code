@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import time
 import os
+from contextlib import nullcontext
 from datetime import datetime
 from torch import nn
 from torch.utils.data import DataLoader
@@ -143,7 +144,8 @@ class HE2RNA(nn.Module):
             # 1. Compute scores exactly ONCE
             B, _, T_max = x.shape
             mask, _ = torch.max(x, dim=1, keepdim=True)
-            mask = (mask > 0).float()
+            # Keep mask in activation dtype to avoid implicit upcast to float32 under AMP.
+            mask = (mask > 0).to(dtype=x.dtype)
             scores = self.conv(x) * mask  # (B, C_out, T_max)
             valid_counts_clamped = mask.sum(dim=2).squeeze(1).clamp(min=1)
 
@@ -190,7 +192,7 @@ class HE2RNA(nn.Module):
                 # Build a mask to zero out positions >= k_per_sample for each sample
                 range_k = torch.arange(max_k_for_gather, device=x.device).view(1, 1, -1)  # (1, 1, max_k_for_gather)
                 k_per_sample_expanded = k_per_sample.view(B, 1, 1)  # (B, 1, 1)
-                topk_mask = (range_k < k_per_sample_expanded).float()  # (B, 1, max_k_for_gather)
+                topk_mask = (range_k < k_per_sample_expanded).to(dtype=scores.dtype)  # (B, 1, max_k_for_gather)
 
                 # Apply mask and compute mean
                 masked_scores = top_k_scores * topk_mask  # (B, C_out, max_k_for_gather)
@@ -212,7 +214,8 @@ class HE2RNA(nn.Module):
         # Build a binary mask of valid tiles based on the raw input.
         # mask: (B, 1, T_max) with 1 where tile is valid.
         mask, _ = torch.max(x, dim=1, keepdim=True)
-        mask = (mask > 0).float()
+        # Keep mask in activation dtype to avoid implicit upcast to float32 under AMP.
+        mask = (mask > 0).to(dtype=x.dtype)
 
         # Run the conv stack on all tiles, then mask invalid ones.
         scores = self.conv(x) * mask  # (B, C_out, T_max)
@@ -264,7 +267,7 @@ class HE2RNA(nn.Module):
         # Build per‑sample mask over the k dimension.
         range_k = torch.arange(max_k, device=x.device).view(1, 1, -1)  # (1,1,max_k)
         k_expanded = k_per_sample.view(B, 1, 1)  # (B,1,1)
-        per_sample_mask = (range_k < k_expanded).float()  # (B,1,max_k)
+        per_sample_mask = (range_k < k_expanded).to(dtype=scores.dtype)  # (B,1,max_k)
 
         # Combined mask over selected tiles: valid AND within per‑sample k
         combined_mask = mask_topk * per_sample_mask  # (B,C_out,max_k)
@@ -294,8 +297,16 @@ def _unpack_batch(batch):
     raise ValueError("Unsupported batch type. Expected tuple/list.")
 
 
+def _autocast_context(use_mixed_precision=False, amp_dtype=torch.float16):
+    """Return an autocast context manager when AMP is enabled on CUDA."""
+    if use_mixed_precision and torch.cuda.is_available():
+        return torch.autocast(device_type='cuda', dtype=amp_dtype)
+    return nullcontext()
+
+
 def training_epoch(model, dataloader, optimizer, 
-                   loss_mode='mse', mse_weight=1.0, corr_weight=1.0):
+                   loss_mode='mse', mse_weight=1.0, corr_weight=1.0,
+                   use_mixed_precision=False, amp_dtype=torch.float16, scaler=None):
     """Train model for one epoch.
     
     Args:
@@ -315,27 +326,34 @@ def training_epoch(model, dataloader, optimizer,
         x, y = _unpack_batch(batch)
         x = x.float().to(model.device)
         y = y.float().to(model.device)
-        
-        # new: ReLU activation is already applied in the forward pass
-        # ReLU activation matching inference (evaluate) function
-        # pred = nn.ReLU()(model(x))
-        
-        if loss_mode == 'combined':
-            loss, mse, corr_loss = combined_loss(
-                pred, y, 
-                mse_weight=mse_weight, 
-                corr_weight=corr_weight
-            )
-            train_mse.append(mse.detach().cpu().numpy())
-            train_corr_loss.append(corr_loss.detach().cpu().numpy())
-        else:
-            # Pure MSE mode (original behavior) 
-            loss = nn.MSELoss()(pred, y)
-        
+
+        optimizer.zero_grad(set_to_none=True)
+        with _autocast_context(use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype):
+            # new: ReLU activation is already applied in the forward pass
+            # ReLU activation matching inference (evaluate) function
+            # pred = nn.ReLU()(model(x))
+            pred = model(x)
+
+            if loss_mode == 'combined':
+                loss, mse, corr_loss = combined_loss(
+                    pred, y, 
+                    mse_weight=mse_weight, 
+                    corr_weight=corr_weight
+                )
+                train_mse.append(mse.detach().cpu().numpy())
+                train_corr_loss.append(corr_loss.detach().cpu().numpy())
+            else:
+                # Pure MSE mode (original behavior) 
+                loss = nn.MSELoss()(pred, y)
+
         train_loss.append(loss.detach().cpu().numpy())
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
     
     results = {'total': float(np.mean(train_loss))}
     if loss_mode == 'combined':
@@ -418,7 +436,7 @@ def compute_correlations(labels, preds, projects):
 
     return np.nanmean(metrics) if len(metrics) > 0 else 0.0
 
-def evaluate(model, dataloader, projects):
+def evaluate(model, dataloader, projects, use_mixed_precision=False, amp_dtype=torch.float16):
     """Evaluate the model on the validation set and return loss and metrics.
     """
     model.eval()
@@ -426,15 +444,19 @@ def evaluate(model, dataloader, projects):
     valid_loss = []
     preds = []
     labels = []
-    for batch in dataloader:
-        x, y = _unpack_batch(batch)
-        pred = model(x.float().to(model.device))
-        labels += [y]
-        loss = loss_fn(pred, y.float().to(model.device))
-        valid_loss += [loss.detach().cpu().numpy()]
-        # new: ReLU activation is already applied in the forward pass
-        # pred = nn.ReLU()(pred)
-        preds += [pred.detach().cpu().numpy()]
+    with torch.no_grad():
+        for batch in dataloader:
+            x, y = _unpack_batch(batch)
+            x = x.float().to(model.device)
+            y_device = y.float().to(model.device)
+            with _autocast_context(use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype):
+                pred = model(x)
+                loss = loss_fn(pred, y_device)
+            labels += [y]
+            valid_loss += [loss.detach().cpu().numpy()]
+            # new: ReLU activation is already applied in the forward pass
+            # pred = nn.ReLU()(pred)
+            preds += [pred.detach().cpu().numpy()]
     valid_loss = np.mean(valid_loss)
     preds = np.concatenate(preds)
     labels = np.concatenate(labels)
@@ -442,18 +464,21 @@ def evaluate(model, dataloader, projects):
     return valid_loss, metrics
 
 
-def predict(model, dataloader):
+def predict(model, dataloader, use_mixed_precision=False, amp_dtype=torch.float16):
     """Perform prediction on the test set.
     """
     model.eval()
     labels = []
     preds = []
-    for batch in dataloader:
-        x, y = _unpack_batch(batch)
-        pred = model(x.float().to(model.device))
-        labels += [y]
-        pred = nn.ReLU()(pred)
-        preds += [pred.detach().cpu().numpy()]
+    with torch.no_grad():
+        for batch in dataloader:
+            x, y = _unpack_batch(batch)
+            x = x.float().to(model.device)
+            with _autocast_context(use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype):
+                pred = model(x)
+            labels += [y]
+            pred = nn.ReLU()(pred)
+            preds += [pred.detach().cpu().numpy()]
     preds = np.concatenate(preds)
     labels = np.concatenate(labels)
     return preds, labels
@@ -500,12 +525,39 @@ def fit(model,
         'max_epochs': 200,
         'patience': 20,
         'batch_size': 16,
-        'num_workers': 0}
+        'num_workers': 0,
+        'mixed_precision': False,
+        'mixed_precision_dtype': 'float16'}
     default_params.update(params)
     batch_size = default_params['batch_size']
     patience = default_params['patience']
     max_epochs = default_params['max_epochs']
     num_workers = default_params['num_workers']
+    use_mixed_precision = bool(default_params.get('mixed_precision', False))
+    mixed_precision_dtype = str(default_params.get('mixed_precision_dtype', 'float16')).lower()
+
+    if use_mixed_precision and (not torch.cuda.is_available() or 'cuda' not in str(model.device).lower()):
+        print("Mixed precision requested but CUDA device is unavailable. Falling back to full precision.")
+        use_mixed_precision = False
+
+    if mixed_precision_dtype == 'bfloat16':
+        amp_dtype = torch.bfloat16
+    elif mixed_precision_dtype in ['float16', 'fp16']:
+        amp_dtype = torch.float16
+    else:
+        raise ValueError(
+            f"Unsupported mixed_precision_dtype '{mixed_precision_dtype}'. "
+            "Use 'float16' or 'bfloat16'."
+        )
+
+    # GradScaler is only required for float16 AMP.
+    scaler = None
+    if use_mixed_precision and amp_dtype == torch.float16:
+        scaler = torch.cuda.amp.GradScaler()
+    print(
+        f"Mixed precision active: {use_mixed_precision} "
+        f"(dtype={str(amp_dtype).replace('torch.', '')})"
+    )
 
     writer = SummaryWriter(log_dir=logdir, flush_secs=30)
 
@@ -533,14 +585,19 @@ def fit(model,
 
     if valid_set is not None:
         valid_loss, best = evaluate(
-            model, valid_loader, valid_projects)
+            model, valid_loader, valid_projects,
+            use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype)
         print('{}: {:.3f}'.format(metrics, best))
         if np.isnan(best):
             best = 0
         if test_set is not None:
-            preds, labels = predict(model, test_loader)
+            preds, labels = predict(
+                model, test_loader,
+                use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype)
         else:
-            preds, labels = predict(model, valid_loader)
+            preds, labels = predict(
+                model, valid_loader,
+                use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype)
 
     try:
 
@@ -554,7 +611,10 @@ def fit(model,
                 model, train_loader, optimizer,
                 loss_mode=loss_mode,
                 mse_weight=mse_weight,
-                corr_weight=corr_weight
+                corr_weight=corr_weight,
+                use_mixed_precision=use_mixed_precision,
+                amp_dtype=amp_dtype,
+                scaler=scaler
             )
             
             # Handle both dict and scalar returns for backward compatibility
@@ -586,7 +646,8 @@ def fit(model,
 
             if valid_set is not None:
                 valid_loss, scores = evaluate(
-                    model, valid_loader, valid_projects)
+                    model, valid_loader, valid_projects,
+                    use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype)
                 dic_loss['valid_loss'] = valid_loss
                 score = np.mean(scores)
                 history.append(score)
@@ -627,9 +688,13 @@ def fit(model,
                     if path is not None:
                         torch.save(model, os.path.join(path, 'model.pt'))
                     elif test_set is not None:
-                        preds, labels = predict(model, test_loader)
+                        preds, labels = predict(
+                            model, test_loader,
+                            use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype)
                     else:
-                        preds, labels = predict(model, valid_loader)
+                        preds, labels = predict(
+                            model, valid_loader,
+                            use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype)
 
                 if epoch_since_best == patience:
                     # Velocity check to override early stopping
@@ -659,9 +724,13 @@ def fit(model,
         torch.save(model, os.path.join(path, 'model.pt'))
 
     if test_set is not None:
-        preds, labels = predict(model, test_loader)
+        preds, labels = predict(
+            model, test_loader,
+            use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype)
     elif valid_set is not None:
-        preds, labels = predict(model, valid_loader)
+        preds, labels = predict(
+            model, valid_loader,
+            use_mixed_precision=use_mixed_precision, amp_dtype=amp_dtype)
     else:
         preds = None
         labels = None

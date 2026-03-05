@@ -86,6 +86,19 @@ class MixedDataset(Dataset):
     def genes(self):
         return self._genes
 
+    def train(self, mode=True):
+        """Propagate train/eval mode to underlying datasets for tile subsampling."""
+        cscc_base = self._unwrap_base_dataset(self.cscc_dataset)
+        tcga_base = self._unwrap_base_dataset(self.tcga_dataset)
+        if hasattr(cscc_base, 'train'):
+            cscc_base.train(mode)
+        if hasattr(tcga_base, 'train'):
+            tcga_base.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
+
 
 class BalancedDomainBatchSampler(Sampler):
     """

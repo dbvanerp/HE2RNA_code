@@ -15,16 +15,43 @@ from utils import summarize_class
 from torch.utils.data import DataLoader
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, ShuffleSplit, train_test_split
 
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
+
+def _get_memory_usage():
+    """Get current memory usage in GB. Returns (used_gb, available_gb, total_gb)."""
+    if HAS_PSUTIL:
+        mem = psutil.virtual_memory()
+        return mem.used / (1024**3), mem.available / (1024**3), mem.total / (1024**3)
+    else:
+        # Fallback: read from /proc/meminfo (Linux)
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = f.read()
+            lines = meminfo.split('\n')
+            mem_total = int([l for l in lines if 'MemTotal' in l][0].split()[1]) / (1024**2)  # GB
+            mem_available = int([l for l in lines if 'MemAvailable' in l][0].split()[1]) / (1024**2)  # GB
+            mem_used = mem_total - mem_available
+            return mem_used, mem_available, mem_total
+        except:
+            return None, None, None
+
+
 class CSCCDataset(Dataset):
     """
     PyTorch Dataset for CSCC multi-instance learning.
     
-    Features: H5 files per patient (filename = study_number.h5)
+    Features: H5 files per patient (filename = study_number.h5) OR aggregated H5 file
     Targets: Bulk RNA-seq from CSV
     Linking: keyfile maps skylinedx_id -> study_number
     
     Args:
-        features_dir: Directory with H5 files (one per patient)
+        features_dir: Directory with H5 files (one per patient). Either this or features_aggregated must be provided.
+        features_aggregated: Path to aggregated H5 file containing all slides. Either this or features_dir must be provided.
         targets_csv: CSV with RNA counts (ID column = skylinedx_id)
         keyfile_paths: Comma-separated list of CSV paths mapping skylinedx_id_rsm2 -> study_number, QC status, CP Score etc
         genes: Optional list of gene columns to use (None = all)
@@ -34,9 +61,10 @@ class CSCCDataset(Dataset):
     
     def __init__(
         self,
-        features_dir: str,
-        targets_csv: str,
-        keyfile_paths: str,
+        features_dir: Optional[str] = None,
+        features_aggregated: Optional[str] = None,
+        targets_csv: Optional[str] = None,
+        keyfile_paths: Optional[str] = None,
         genes: Optional[List[str]] = None,
         max_tiles: int = 8000,
         log_transform: bool = True,
@@ -44,23 +72,51 @@ class CSCCDataset(Dataset):
     ):
         print(f"\n{'-'*15} Initializing CSCCDataset {'-'*15}\n")
         
-        self.features_dir = Path(features_dir)
+        self.features_dir = Path(features_dir) if features_dir is not None else None
+        self.features_aggregated = features_aggregated
         self.max_tiles = max_tiles
         self.log_transform = log_transform
         self.project_column = project_column
-        self.keyfile_paths = keyfile_paths.split(',')
+        self.keyfile_paths = keyfile_paths.split(',') if keyfile_paths else []
+        self.training = False  # Training mode flag for stochastic tile subsampling
 
-        # Load keyfile for ID mapping
-        self.id_to_study = self._load_keyfile(self.keyfile_paths)
+        # Validate that at least one feature source is provided
+        if self.features_dir is None and self.features_aggregated is None:
+            raise ValueError("Either features_dir or features_aggregated must be provided")
+
+        # Load keyfile for ID mapping (if provided)
+        if self.keyfile_paths:
+            self.id_to_study = self._load_keyfile(self.keyfile_paths)
+        else:
+            self.id_to_study = {}
         
-        # Load features index (study_number -> h5_path)
-        self.feature_files = self._index_features()
+        # Load features index based on mode
+        if self.features_dir is not None:
+            # Per-slide H5 files mode
+            self.aggregated = False
+            self.feature_files = self._index_features()
+        elif self.features_aggregated is not None:
+            # Aggregated H5 file mode
+            self.aggregated = True
+            self.aggregated_h5 = h5py.File(self.features_aggregated, 'r')
+            # Build mapping: slide_name -> index in the dataset
+            slide_names = self.aggregated_h5['slide_name'][:]
+            # Convert bytes to strings if needed and create index mapping
+            if isinstance(slide_names[0], bytes):
+                self.feature_files = {k.decode(): idx for idx, k in enumerate(slide_names)}
+            else:
+                self.feature_files = {str(k): idx for idx, k in enumerate(slide_names)}
+            print(f"Indexed {len(self.feature_files)} samples from aggregated H5 file")
         
         # Load targets and map to study_numbers
         self.targets_df, self.target_study_numbers = self._load_targets(targets_csv)
         
         # Find intersection: patients with both features AND targets
         self.study_numbers = self._align_patients()
+        
+        # For aggregated case, load features into memory to avoid I/O bottlenecks
+        if self.aggregated:
+            self._load_aggregated_features_to_memory()
         
         # Select genes
         if genes is None:
@@ -76,7 +132,10 @@ class CSCCDataset(Dataset):
         # Infer feature dimension
         self.feature_dim = self._get_feature_dim()
         
-        self.metadata = self._load_metadata(self.keyfile_paths[0])
+        if self.keyfile_paths:
+            self.metadata = self._load_metadata(self.keyfile_paths[0])
+        else:
+            self.metadata = None
 
         print(f"\n{'-'*15} CSCCDataset initialized: {len(self)} patients, {len(self.genes)} genes, {self.feature_dim}D features {'-'*15}\n")
         print(f"Full summary of the dataset:")
@@ -138,6 +197,106 @@ class CSCCDataset(Dataset):
         print(f"  Found {len(feature_files)} H5 feature files")
         return feature_files
 
+    def _load_aggregated_features_to_memory(self):
+        """Load all aggregated features into memory with pre-processing (padding/random selection) for fast access during training."""
+        print(f"\nLoading aggregated features into memory...")
+        print(f"  Loading {len(self.study_numbers)} samples from H5 file")
+        
+        # Check initial memory
+        used_gb, available_gb, total_gb = _get_memory_usage()
+        if used_gb is not None:
+            print(f"  Initial memory: {used_gb:.2f} GB used, {available_gb:.2f} GB available, {total_gb:.2f} GB total")
+        
+        # First, get feature_dim from first sample
+        first_study = self.study_numbers[0]
+        first_h5_idx = self.feature_files[first_study]
+        first_data = self.aggregated_h5['X'][first_h5_idx, :]
+        first_data = first_data[:, 3:]  # Remove first 3 columns (metadata)
+        feature_dim = first_data.shape[1]
+        
+        # Estimate memory per sample (max_tiles x feature_dim x 4 bytes for float32)
+        estimated_mb_per_sample = (self.max_tiles * feature_dim * 4) / (1024 * 1024)
+        estimated_total_gb = (estimated_mb_per_sample * len(self.study_numbers)) / 1024
+        print(f"  Estimated memory per sample: {estimated_mb_per_sample:.2f} MB")
+        print(f"  Estimated total cache size: {estimated_total_gb:.2f} GB")
+        
+        self.aggregated_features_cache = {}
+        rng = np.random.default_rng(seed=42)
+        
+        # Memory check intervals: every 1000 samples or every 10GB estimated
+        check_interval = max(100, min(1000, len(self.study_numbers) // 20))  # Check ~20 times during loading
+        last_check_idx = 0
+        last_check_memory = used_gb
+        
+        # Load and pre-process features for all aligned study_numbers
+        for idx, study_number in enumerate(tqdm(self.study_numbers, desc="  Loading & processing features")):
+            if study_number in self.feature_files:
+                h5_idx = self.feature_files[study_number]
+                # Load from H5
+                data = self.aggregated_h5['X'][h5_idx, :]
+                data = data[:, 3:]  # Remove first 3 columns (metadata)
+                n_tiles = data.shape[0]
+                
+                # Apply padding and/or random selection
+                if n_tiles > self.max_tiles:
+                    # Random selection
+                    selected_indices = rng.choice(n_tiles, self.max_tiles, replace=False)
+                    selected_indices = np.sort(selected_indices)  # Sort for consistency
+                    data = data[selected_indices, :]
+                elif n_tiles < self.max_tiles:
+                    # Padding
+                    padded = np.zeros((self.max_tiles, feature_dim), dtype=np.float32)
+                    padded[:n_tiles] = data
+                    data = padded
+                # If n_tiles == self.max_tiles, data is already correct size
+                
+                # Convert to torch tensor and store in cache
+                self.aggregated_features_cache[study_number] = torch.from_numpy(data.astype(np.float32))
+            
+            # Periodic memory check
+            if (idx + 1) % check_interval == 0 or idx == len(self.study_numbers) - 1:
+                used_gb, available_gb, total_gb = _get_memory_usage()
+                if used_gb is not None:
+                    samples_loaded = idx + 1
+                    memory_delta = used_gb - last_check_memory if last_check_memory is not None else None
+                    cache_memory_mb = sum(
+                        tensor.element_size() * tensor.nelement() / (1024 * 1024) 
+                        for tensor in self.aggregated_features_cache.values()
+                    )
+                    cache_memory_gb = cache_memory_mb / 1024
+                    
+                    print(f"  Progress: {samples_loaded}/{len(self.study_numbers)} samples loaded")
+                    print(f"    Cache size: {cache_memory_gb:.2f} GB")
+                    print(f"    System memory: {used_gb:.2f} GB used, {available_gb:.2f} GB available")
+                    if memory_delta is not None:
+                        print(f"    Memory increase since last check: {memory_delta:.2f} GB")
+                    
+                    # Warn if available memory is getting low
+                    if available_gb < 10:
+                        print(f"    WARNING: Only {available_gb:.2f} GB available! Risk of OOM.")
+                    elif available_gb < 20:
+                        print(f"    WARNING: Low available memory: {available_gb:.2f} GB")
+                    
+                    last_check_memory = used_gb
+                    last_check_idx = idx
+        
+        # Close H5 file since we've loaded everything into memory
+        self.aggregated_h5.close()
+        self.aggregated_h5 = None
+        
+        # Final memory check
+        used_gb, available_gb, total_gb = _get_memory_usage()
+        if used_gb is not None:
+            print(f"  Final memory: {used_gb:.2f} GB used, {available_gb:.2f} GB available")
+        
+        # Calculate memory usage
+        total_memory_mb = sum(
+            tensor.element_size() * tensor.nelement() / (1024 * 1024) 
+            for tensor in self.aggregated_features_cache.values()
+        )
+        print(f"  Loaded {len(self.aggregated_features_cache)} samples into memory (pre-processed)")
+        print(f"  Total cache memory usage: {total_memory_mb:.2f} MB ({total_memory_mb/1024:.2f} GB)")
+
     def _load_targets(self, targets_csv: str):
         """
         Load and transpose targets CSV so that columns are genes and rows are patients (samples),
@@ -179,38 +338,47 @@ class CSCCDataset(Dataset):
         return df, study_numbers
 
     def _load_features(self, study_number: str) -> torch.Tensor:
-        """Load and pad features for a patient. If there are more than max_tiles, pick a random subset (seed=42)."""
-        h5_path = self.feature_files[study_number]
-        with h5py.File(h5_path, 'r') as f:
-            data = f['features'][:]
-        
-        n_tiles = data.shape[0]
-        
-        if n_tiles > self.max_tiles:
-            rng = np.random.default_rng(seed=42)
-            selected_indices = rng.choice(n_tiles, self.max_tiles, replace=False)
-            selected_indices = np.sort(selected_indices)  # optional: sort for consistency
-            data = data[selected_indices, :]
-        elif n_tiles < self.max_tiles:
-            padded = np.zeros((self.max_tiles, self.feature_dim), dtype=np.float32)
-            padded[:n_tiles] = data
-            data = padded
-        # If n_tiles == self.max_tiles do nothing
+        """Load and pad features for a patient. If there are more than max_tiles, pick a random subset.
 
-        return torch.from_numpy(data.astype(np.float32))
-        
-        for idx, sid in enumerate(df['ID']):
-            if sid in self.id_to_study:
-                study_numbers.append(self.id_to_study[sid])
-                valid_rows.append(idx)
-            else:
-                print(f"Warning: ID {sid} not found in keyfile, skipping")
-        
-        df = df.iloc[valid_rows].reset_index(drop=True)
-        df['study_number'] = study_numbers
-        
-        print(f"Loaded {len(df)} targets with valid study_numbers")
-        return df, study_numbers
+        During training: uses torch.randperm without local seed for stochastic subsampling
+        (different subset each oversampled call, controlled by global RNG).
+        During evaluation: uses deterministic seed for reproducibility.
+
+        Returns tensor of shape (max_tiles, feature_dim).
+        """
+        if self.aggregated:
+            # Aggregated mode: load from pre-processed cache
+            # Cache stores features already padded to (max_tiles, feature_dim)
+            return self.aggregated_features_cache[study_number]
+        else:
+            # Per-slide H5 mode: load from individual H5 file
+            h5_path = self.feature_files[study_number]
+            with h5py.File(h5_path, 'r') as f:
+                data = f['features'][:]
+
+            n_tiles = data.shape[0]
+
+            if n_tiles > self.max_tiles:
+                if self.training:
+                    # Training: stochastic subsampling using global PyTorch RNG
+                    # Each oversampled call gets a different subset, controlled by DataLoader's worker seed
+                    indices = torch.randperm(n_tiles)[:self.max_tiles]
+                    indices = torch.sort(indices)[0]  # Sort for consistency
+                else:
+                    # Evaluation: deterministic subsampling for reproducibility
+                    # Use a fixed seed based on patient index for consistency across runs
+                    patient_idx = self.study_numbers.index(study_number)
+                    g = torch.Generator().manual_seed(42 + patient_idx)
+                    indices = torch.randperm(n_tiles, generator=g)[:self.max_tiles]
+                    indices = torch.sort(indices)[0]
+                data = data[indices.numpy(), :]
+            elif n_tiles < self.max_tiles:
+                padded = np.zeros((self.max_tiles, self.feature_dim), dtype=np.float32)
+                padded[:n_tiles] = data
+                data = padded
+            # If n_tiles == self.max_tiles do nothing
+
+            return torch.from_numpy(data.astype(np.float32))
     
     def _align_patients(self) -> List[str]:
         """Find patients with both features and targets."""
@@ -298,10 +466,29 @@ class CSCCDataset(Dataset):
         return targets
     
     def _get_feature_dim(self) -> int:
-        """Infer feature dimension from first H5 file."""
+        """Infer feature dimension from first sample."""
         first_study = self.study_numbers[0]
-        with h5py.File(self.feature_files[first_study], 'r') as f:
-            return f['features'].shape[1]
+        if self.aggregated:
+            # Aggregated mode: read from H5 file using index
+            # Check if cache exists (loaded after alignment)
+            if hasattr(self, 'aggregated_features_cache') and first_study in self.aggregated_features_cache:
+                # Cache is loaded, get feature_dim from cached tensor (already processed)
+                cached_tensor = self.aggregated_features_cache[first_study]
+                return cached_tensor.shape[1]
+            elif self.aggregated_h5 is not None:
+                # H5 file still open, read from it
+                h5_idx = self.feature_files[first_study]
+                data = self.aggregated_h5['X'][h5_idx, :]
+                data = data[:, 3:]  # Strip first 3 metadata columns
+                return data.shape[1]
+            else:
+                # Fallback to cache if H5 is closed
+                cached_tensor = self.aggregated_features_cache[first_study]
+                return cached_tensor.shape[1]
+        else:
+            # Per-slide H5 mode
+            with h5py.File(self.feature_files[first_study], 'r') as f:
+                return f['features'].shape[1]
     
     def _load_features_nosubsample(self, study_number: str) -> torch.Tensor:
         """Load and pad features for a patient."""
@@ -588,10 +775,11 @@ class CSCCDataset(Dataset):
     
     def __getitem__(self, idx: int):
         study_number = self.study_numbers[idx]
-        
-        # Features: (max_tiles, feature_dim)
-        features = self._load_features(study_number)
-        
+
+        # Features from _load_features are (max_tiles, feature_dim);
+        # transpose to (feature_dim, max_tiles) to match model expectations.
+        features = self._load_features(study_number).transpose(0, 1)
+
         # Targets: (n_genes,)
         targets = torch.from_numpy(self.targets[idx])
         
@@ -603,6 +791,8 @@ class CSCCDataset(Dataset):
     @property
     def projects(self) -> pd.Series:
         """Return the projects in the dataset as a pandas Series, matched to study_number order (study_number is the index)."""
+        if self.metadata is None:
+            raise ValueError("Metadata not available. Provide keyfile_paths to access projects.")
         return self.metadata.loc[self.study_numbers, self.project_column]
     
     @property
@@ -614,6 +804,23 @@ class CSCCDataset(Dataset):
     def dim(self) -> int:
         """Feature dimension for model initialization."""
         return self.feature_dim
+
+    def train(self, mode: bool = True):
+        """Set training mode for stochastic tile subsampling.
+
+        During training, slides with >max_tiles will use different random subsets
+        each time they are loaded (data augmentation). During evaluation, the same
+        deterministic subset is used for reproducibility.
+
+        Args:
+            mode: True for training mode (stochastic), False for eval mode (deterministic)
+        """
+        self.training = bool(mode)
+        return self
+
+    def eval(self):
+        """Set evaluation mode (deterministic tile subsampling)."""
+        return self.train(False)
 
 
 # === Optional: collate function if you need metadata ===

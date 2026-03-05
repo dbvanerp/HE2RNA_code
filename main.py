@@ -168,6 +168,10 @@ class Experiment(object):
                 training_params['batch_size'] = int(dic['batch_size'])
             if 'num_workers' in dic.keys():
                 training_params['num_workers'] = int(dic['num_workers'])
+            if 'mixed_precision' in dic.keys():
+                training_params['mixed_precision'] = dic['mixed_precision'].strip().lower() in ['1', 'true', 'yes', 'y']
+            if 'mixed_precision_dtype' in dic.keys():
+                training_params['mixed_precision_dtype'] = dic['mixed_precision_dtype'].strip().lower()
 
         return training_params
 
@@ -377,6 +381,8 @@ class Experiment(object):
         cscc_subset = Subset(cscc_dataset, cscc_indices)
         tcga_subset = Subset(tcga_dataset, np.arange(len(tcga_dataset)))
         mixed_train_set = MixedDataset(cscc_subset, tcga_subset)
+        # Set training mode for stochastic tile subsampling (different tiles each epoch)
+        mixed_train_set.train()
         sampler = BalancedDomainBatchSampler(
             domain_labels=mixed_train_set.domain_labels,
             batch_size=batch_size,
@@ -398,10 +404,23 @@ class Experiment(object):
                 )
         else:
             safe_num_workers = int(num_workers)
+
+        # Worker initialization function for reproducible randomness in multi-worker DataLoader
+        def seed_worker(worker_id):
+            worker_seed = torch.initial_seed() % 2**32
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+
+        # Generator for reproducible shuffling
+        g = torch.Generator()
+        g.manual_seed(seed)
+
         return DataLoader(
             mixed_train_set,
             batch_sampler=sampler,
-            num_workers=safe_num_workers
+            num_workers=safe_num_workers,
+            worker_init_fn=seed_worker if safe_num_workers > 0 else None,
+            generator=g
         )
 
     def _write_run_metadata(self, log_object):
@@ -446,8 +465,37 @@ class Experiment(object):
 
         # CSCC mode: load full dataset using CSCCDataset class
         if self.data_mode == 'cscc':
-            dataset = CSCCDataset(dic['path_to_data'], dic['path_to_transcriptome'], dic['keyfile_path'], genes, project_column=dic['project_column'])
-            print(f"Data mode: CSCC. Loading from {os.path.basename(dic['path_to_data'])}, {os.path.basename(dic['path_to_transcriptome'])}, {os.path.basename(dic['keyfile_path'])}")
+            cscc_path_to_data = dic['path_to_data']
+            project_column = dic['project_column']
+
+            # Support both per-slide H5 directories and aggregated H5 files
+            if os.path.isdir(cscc_path_to_data):
+                dataset = CSCCDataset(
+                    features_dir=cscc_path_to_data,
+                    targets_csv=dic['path_to_transcriptome'],
+                    keyfile_paths=dic['keyfile_path'],
+                    genes=genes,
+                    project_column=project_column,
+                )
+            elif cscc_path_to_data.endswith('.h5'):
+                # Aggregated CSCC H5: use same 100-tile convention as aggregated TCGA
+                dataset = CSCCDataset(
+                    features_aggregated=cscc_path_to_data,
+                    targets_csv=dic['path_to_transcriptome'],
+                    keyfile_paths=dic['keyfile_path'],
+                    genes=genes,
+                    max_tiles=100,
+                    project_column=project_column,
+                )
+            else:
+                raise ValueError(f"Unsupported path_to_data format for CSCC: {cscc_path_to_data}")
+
+            print(
+                "Data mode: CSCC. Loading from "
+                f"{os.path.basename(dic['path_to_data'])}, "
+                f"{os.path.basename(dic['path_to_transcriptome'])}, "
+                f"{os.path.basename(dic['keyfile_path'])}"
+            )
             summarize_class(dataset)
             return dataset 
 
@@ -490,13 +538,27 @@ class Experiment(object):
         elif self.data_mode == 'mixed_cscc_tcga_anchor':
             # CSCC dataset (target domain)
             project_column = dic['project_column'] if 'project_column' in dic.keys() else 'metastasis'
-            cscc_dataset = CSCCDataset(
-                dic['path_to_data'],
-                dic['path_to_transcriptome'],
-                dic['keyfile_path'],
-                genes,
-                project_column=project_column
-            )
+            cscc_path_to_data = dic['path_to_data']
+
+            if os.path.isdir(cscc_path_to_data):
+                cscc_dataset = CSCCDataset(
+                    features_dir=cscc_path_to_data,
+                    targets_csv=dic['path_to_transcriptome'],
+                    keyfile_paths=dic['keyfile_path'],
+                    genes=genes,
+                    project_column=project_column,
+                )
+            elif cscc_path_to_data.endswith('.h5'):
+                cscc_dataset = CSCCDataset(
+                    features_aggregated=cscc_path_to_data,
+                    targets_csv=dic['path_to_transcriptome'],
+                    keyfile_paths=dic['keyfile_path'],
+                    genes=genes,
+                    max_tiles=100,
+                    project_column=project_column,
+                )
+            else:
+                raise ValueError(f"Unsupported path_to_data format for CSCC in mixed mode: {cscc_path_to_data}")
 
             # TCGA anchor dataset (replay buffer domain)
             if 'tcga_path_to_data' not in dic.keys() or 'tcga_path_to_transcriptome' not in dic.keys() or 'tcga_keyfile_path' not in dic.keys():
