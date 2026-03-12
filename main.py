@@ -35,6 +35,7 @@ from torch.utils.data import Subset, DataLoader
 from torch import optim
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, ShuffleSplit
+from utils import compute_metrics, summarize_class, save_patient_splits, _plot_pred_vs_gt_scatter
 # from transcriptome_data import TranscriptomeDataset
 # from wsi_data import load_labels, AggregatedDataset, TCGAFolder, \
 #     H5Dataset, patient_split, match_patient_split, \
@@ -43,7 +44,6 @@ from CSCCDatasetClass import CSCCDataset
 from TCGADatasetClass import TCGADataset, match_patient_kfold, match_patient_single
 from mixed_dataset import MixedDataset, BalancedDomainBatchSampler
 from model import HE2RNA, fit, predict
-from utils import compute_metrics, summarize_class, save_patient_splits
 from constant import PATH_TO_TILES
 
 
@@ -57,7 +57,8 @@ class Experiment(object):
 
     def __init__(self,
                  configfile='config.ini',
-                 null_run=False):
+                 null_run=False,
+                 inference=False):
         print(f"Initializing the Experiment class")
         # Read configuration file
         self.config = configparser.ConfigParser()
@@ -88,6 +89,19 @@ class Experiment(object):
             print(f"Using saved model from {self.use_saved_model} with fold {self.fold}")
         else:
             self.use_saved_model = False
+
+        # Inference mode: require use_saved_model path and always use saved models
+        self.inference = inference
+        if 'use_saved_model' in self.config['main'].keys():
+            self.use_saved_model = self.config['main']['use_saved_model']
+        else:
+            self.use_saved_model = None
+        if self.inference:
+            if not self.use_saved_model:
+                raise ValueError("Inference mode requires [main] use_saved_model in the config.")
+            if not os.path.exists(self.use_saved_model):
+                raise FileNotFoundError(f"Inference use_saved_model path does not exist: {self.use_saved_model}")
+            print(f"Inference mode enabled. Using saved models from {self.use_saved_model}")
 
         if 'single_split' in self.config['main'].keys():
             self.split = pkl.load(open(self.config['main']['single_split'], 'rb'))
@@ -440,6 +454,8 @@ class Experiment(object):
         preds, labels = predict(model, loader)
         return preds, labels
 
+
+
     def _build_dataset(self):
 
         assert 'data' in self.config.sections(), \
@@ -788,28 +804,37 @@ class Experiment(object):
 
             test_projects = np.array([str(x).replace('_', '-') for x in cscc_dataset.projects.iloc[test_idx[k]].values])
 
-            model = self._initialize_model(cp.deepcopy(model_params), train_set_cscc, k)
-            if self.null_run:
+            if self.inference:
+                model = self._load_saved_model_for_fold(k, cp.deepcopy(model_params))
+                if model is None:
+                    raise ValueError(
+                        "Inference mode for mixed_cscc_tcga_anchor requires use_saved_model "
+                        "to point to a directory with per-fold models."
+                    )
                 preds, labels = self._predict_without_training(model, test_set, training_params)
-                fold_path = os.path.join(self.savedir, 'model_' + str(k))
-                os.makedirs(fold_path, exist_ok=True)
-                torch.save(model, os.path.join(fold_path, 'model.pt'))
             else:
-                optimizer = self._setup_optimization(model)
-                loss_params = self._read_loss_params()
-                preds, labels = fit(
-                    model,
-                    train_set_cscc,
-                    valid_set,
-                    valid_projects,
-                    test_set=test_set,
-                    params=training_params,
-                    optimizer=optimizer,
-                    logdir=fold_logdir,
-                    path=os.path.join(self.savedir, 'model_' + str(k)),
-                    train_loader=train_loader,
-                    **loss_params
-                )
+                model = self._initialize_model(cp.deepcopy(model_params), train_set_cscc, k)
+                if self.null_run:
+                    preds, labels = self._predict_without_training(model, test_set, training_params)
+                    fold_path = os.path.join(self.savedir, 'model_' + str(k))
+                    os.makedirs(fold_path, exist_ok=True)
+                    torch.save(model, os.path.join(fold_path, 'model.pt'))
+                else:
+                    optimizer = self._setup_optimization(model)
+                    loss_params = self._read_loss_params()
+                    preds, labels = fit(
+                        model,
+                        train_set_cscc,
+                        valid_set,
+                        valid_projects,
+                        test_set=test_set,
+                        params=training_params,
+                        optimizer=optimizer,
+                        logdir=fold_logdir,
+                        path=os.path.join(self.savedir, 'model_' + str(k)),
+                        train_loader=train_loader,
+                        **loss_params
+                    )
 
             full_preds[test_idx[k]] = preds
             full_labels[test_idx[k]] = labels
@@ -850,11 +875,52 @@ class Experiment(object):
 
         report = pd.DataFrame(report)
         report_whole_dataset = pd.DataFrame(report_whole_dataset)
-        filename = 'results_per_fold_null.csv' if self.null_run else 'results_per_fold.csv'
-        filename_whole_dataset = 'results_whole_dataset_null.csv' if self.null_run else 'results_whole_dataset.csv'
+        if self.inference:
+            filename = 'results_per_fold_inference.csv'
+            filename_whole_dataset = 'results_whole_dataset_inference.csv'
+        else:
+            filename = 'results_per_fold_null.csv' if self.null_run else 'results_per_fold.csv'
+            filename_whole_dataset = 'results_whole_dataset_null.csv' if self.null_run else 'results_whole_dataset.csv'
         report.to_csv(os.path.join(self.savedir, filename), index=False)
         report_whole_dataset.to_csv(os.path.join(self.savedir, filename_whole_dataset), index=False)
         self._write_run_metadata(metadata)
+
+        if self.inference:
+            patients_array = cscc_dataset.patients
+            test_mask = visited_mask
+            raw_pred_df = pd.DataFrame(full_preds[test_mask].T, index=list(cscc_dataset.genes), columns=patients_array[test_mask])
+            raw_gt_df = pd.DataFrame(full_labels[test_mask].T, index=list(cscc_dataset.genes), columns=patients_array[test_mask])
+            raw_pred_df.to_csv(os.path.join(self.savedir, 'raw_predictions.csv'))
+            raw_gt_df.to_csv(os.path.join(self.savedir, 'raw_ground_truth.csv'))
+
+            scatter_dir = os.path.join(self.savedir, 'scatter_plots')
+            all_projects = np.array([str(x).replace('_', '-') for x in cscc_dataset.projects.values])
+            unique_projects = np.unique(all_projects)
+            for project in unique_projects:
+                proj_mask = (all_projects == project) & test_mask
+                if not np.any(proj_mask):
+                    continue
+                proj_title = f'{project}: Predicted vs Ground Truth Gene Expression'
+                out_path = os.path.join(scatter_dir, f'{project}_pred_vs_gt.png')
+                _plot_pred_vs_gt_scatter(
+                    pred_matrix=full_preds[proj_mask],
+                    gt_matrix=full_labels[proj_mask],
+                    gene_names=list(cscc_dataset.genes),
+                    title=proj_title,
+                    output_path=out_path,
+                    average_per_gene=False,
+                )
+            overall_title = 'OVERALL: Predicted vs Ground Truth Gene Expression'
+            overall_path = os.path.join(scatter_dir, 'OVERALL_pred_vs_gt.png')
+            _plot_pred_vs_gt_scatter(
+                pred_matrix=full_preds[test_mask],
+                gt_matrix=full_labels[test_mask],
+                gene_names=list(cscc_dataset.genes),
+                title=overall_title,
+                output_path=overall_path,
+                average_per_gene=False,
+            )
+
         return report, report_whole_dataset
 
     def _cross_validation_mixed_nested(self, n_folds=5, random_state=0, logdir='exp'):
@@ -1097,11 +1163,11 @@ class Experiment(object):
         test_projects = dataset.projects[test_idx].apply(
             lambda x: x.replace('_', '-')).values
 
-        if self.use_saved_model:
-            
-            model = torch.load(os.path.join(
-                               self.use_saved_model,
-                               'model.pt'))
+        if self.inference:
+            model_path = os.path.join(self.use_saved_model, 'model.pt')
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Inference model not found at {model_path}")
+            model = torch.load(model_path)
             if 'ks' in model_params.keys():
                 model.ks = model_params['ks']
             if 'top_k' in model_params.keys():
@@ -1114,40 +1180,59 @@ class Experiment(object):
                 model.proportional_ks = model_params['proportional_ks']
             else:
                 model.proportional_ks = False
+            preds, labels = self._predict_without_training(model, test_set, training_params)
+        else:
+            if self.use_saved_model:
+                
+                model = torch.load(os.path.join(
+                                   self.use_saved_model,
+                                   'model.pt'))
+                if 'ks' in model_params.keys():
+                    model.ks = model_params['ks']
+                if 'top_k' in model_params.keys():
+                    model.top_k = model_params['top_k']
+                if 'bottom_ks' in model_params.keys():
+                    model.bottom_ks = model_params['bottom_ks']
+                if 'dropout' in model_params.keys():
+                    model.do.p = model_params['dropout']
+                if 'proportional_ks' in model_params.keys():
+                    model.proportional_ks = model_params['proportional_ks']
+                else:
+                    model.proportional_ks = False
 
-        else:
-            print("Initializing model without saved model")
-            # Initialize bias of the last layer with the average target value on the train set
-            try:
-                model_params['bias_init'] = torch.nn.Parameter(
-                    torch.Tensor(
-                        np.mean(
-                            [sample[1] for sample in train_set], axis=0)
-                        ).cuda())
-            except ValueError:
-                model_params['bias_init'] = torch.nn.Parameter(
-                    torch.Tensor(
-                        np.mean(
-                            [sample[1].numpy() for sample in train_set], axis=0)
-                        ).cuda())
-            model = HE2RNA(**model_params)
-        if self.null_run:
-            preds, labels = self._predict_without_training(
-                model, test_set, training_params)
-            torch.save(model, os.path.join(self.savedir, 'model_null.pt'))
-        else:
-            optimizer = self._setup_optimization(model)
-            loss_params = self._read_loss_params()
-            preds, labels = fit(model,
-                                train_set,
-                                valid_set,
-                                valid_projects,
-                                test_set=test_set,
-                                params=training_params,
-                                optimizer=optimizer,
-                                logdir=logdir,
-                                path=self.savedir,
-                                **loss_params)
+            else:
+                print("Initializing model without saved model")
+                # Initialize bias of the last layer with the average target value on the train set
+                try:
+                    model_params['bias_init'] = torch.nn.Parameter(
+                        torch.Tensor(
+                            np.mean(
+                                [sample[1] for sample in train_set], axis=0)
+                            ).cuda())
+                except ValueError:
+                    model_params['bias_init'] = torch.nn.Parameter(
+                        torch.Tensor(
+                            np.mean(
+                                [sample[1].numpy() for sample in train_set], axis=0)
+                            ).cuda())
+                model = HE2RNA(**model_params)
+            if self.null_run:
+                preds, labels = self._predict_without_training(
+                    model, test_set, training_params)
+                torch.save(model, os.path.join(self.savedir, 'model_null.pt'))
+            else:
+                optimizer = self._setup_optimization(model)
+                loss_params = self._read_loss_params()
+                preds, labels = fit(model,
+                                    train_set,
+                                    valid_set,
+                                    valid_projects,
+                                    test_set=test_set,
+                                    params=training_params,
+                                    optimizer=optimizer,
+                                    logdir=logdir,
+                                    path=self.savedir,
+                                    **loss_params)
 
         report = {'gene': list(dataset.genes)}
 
@@ -1158,25 +1243,57 @@ class Experiment(object):
                 label, pred)
 
         report = pd.DataFrame(report)
-        filename = 'results_single_split_null.csv' if self.null_run else 'results_single_split.csv'
+        if self.inference:
+            filename = 'results_single_split_inference.csv'
+        else:
+            filename = 'results_single_split_null.csv' if self.null_run else 'results_single_split.csv'
         report.to_csv(os.path.join(self.savedir, filename), index=False)
+
+        # Save raw predictions and ground truth for single-run inference
+        if self.inference:
+            patients_array = dataset.patients.values if hasattr(dataset.patients, 'values') else np.array(dataset.patients)
+            test_patients = patients_array[test_idx]
+            raw_pred_df = pd.DataFrame(preds.T, index=list(dataset.genes), columns=test_patients)
+            raw_gt_df = pd.DataFrame(labels.T, index=list(dataset.genes), columns=test_patients)
+            raw_pred_df.to_csv(os.path.join(self.savedir, 'raw_predictions_single_run.csv'))
+            raw_gt_df.to_csv(os.path.join(self.savedir, 'raw_ground_truth_single_run.csv'))
+
+            # Per-project and overall scatter plots
+            scatter_dir = os.path.join(self.savedir, 'scatter_plots')
+            for project in np.unique(test_projects):
+                mask = test_projects == project
+                if not np.any(mask):
+                    continue
+                proj_title = f'{project}: Predicted vs Ground Truth Gene Expression'
+                out_path = os.path.join(scatter_dir, f'{project}_pred_vs_gt.png')
+                _plot_pred_vs_gt_scatter(
+                    pred_matrix=preds[mask],
+                    gt_matrix=labels[mask],
+                    gene_names=list(dataset.genes),
+                    title=proj_title,
+                    output_path=out_path,
+                    average_per_gene=False,
+                )
+            overall_title = 'OVERALL: Predicted vs Ground Truth Gene Expression'
+            overall_path = os.path.join(scatter_dir, 'OVERALL_pred_vs_gt.png')
+            _plot_pred_vs_gt_scatter(
+                pred_matrix=preds,
+                gt_matrix=labels,
+                gene_names=list(dataset.genes),
+                title=overall_title,
+                output_path=overall_path,
+                average_per_gene=False,
+            )
+
         return report
 
     def cross_validation(self, n_folds=5, random_state=0, logdir='exp'):
-        """N-fold cross-validation.
-
-        Args:
-            n (int): Number of folds
-            random_state (int): Random seed used for splitting the data.
-            logdir (str): Path for TensoboardX.
-
-        Returns:
-            pandas DataFrame: The metrics per gene and per fold.
-        """
+        """N-fold cross-validation."""
         if self.data_mode == 'mixed_cscc_tcga_anchor':
             use_nested = self._read_bool('training', 'nested_cv', default=False)
-            if use_nested:
+            if use_nested and not self.inference:
                 return self._cross_validation_mixed_nested(n_folds=n_folds, random_state=random_state, logdir=logdir)
+            # For inference, always use outer CV with provided saved models
             return self._cross_validation_mixed_outer(n_folds=n_folds, random_state=random_state, logdir=logdir)
 
         model_params = self._read_architecture()
@@ -1302,12 +1419,12 @@ class Experiment(object):
             print(f"Fold {k} patient lengths: {len(train_patients_fold)}, {len(test_patients_fold)}, {len(valid_patients_fold)}")
 
 
-            # Initialize the model and define optimizer
-            if self.use_saved_model:
-                model = torch.load(os.path.join(
-                                   self.use_saved_model,
-                                   'model_' + str(k),
-                                   'model.pt'))
+            # Initialize the model and define optimizer / inference behaviour
+            if self.inference:
+                model_path = os.path.join(self.use_saved_model, f'model_{k}', 'model.pt')
+                if not os.path.exists(model_path):
+                    raise FileNotFoundError(f"Inference model for fold {k} not found at {model_path}")
+                model = torch.load(model_path)
                 if 'ks' in model_params.keys():
                     model.ks = model_params['ks']
                 if 'top_k' in model_params.keys():
@@ -1320,46 +1437,65 @@ class Experiment(object):
                     model.proportional_ks = model_params['proportional_ks']
                 else:
                     model.proportional_ks = False
-
+                preds, labels = self._predict_without_training(model, test_set, training_params)
             else:
-                # Initialize bias of the last layer with the average target value on the train set
-                print("Initializing model without saved model")
-                try:
-                    model_params['bias_init'] = torch.nn.Parameter(
-                        torch.Tensor(
-                            np.mean(
-                                [sample[1] for sample in train_set], axis=0)
-                        ).cuda())
-                except ValueError:
-                    model_params['bias_init'] = torch.nn.Parameter(
-                        torch.Tensor(
-                            np.mean(
-                                [sample[1].numpy() for sample in train_set], axis=0)
-                        ).cuda())
-                model = HE2RNA(**model_params)
-            if self.null_run:
-                preds, labels = self._predict_without_training(
-                    model, test_set, training_params)
-                fold_path = os.path.join(self.savedir, 'model_' + str(k))
-                os.makedirs(fold_path, exist_ok=True)
-                torch.save(model, os.path.join(fold_path, 'model.pt'))
-            else:
-                optimizer = self._setup_optimization(model)
-                loss_params = self._read_loss_params()
+                if self.use_saved_model:
+                    model = torch.load(os.path.join(
+                                       self.use_saved_model,
+                                       'model_' + str(k),
+                                       'model.pt'))
+                    if 'ks' in model_params.keys():
+                        model.ks = model_params['ks']
+                    if 'top_k' in model_params.keys():
+                        model.top_k = model_params['top_k']
+                    if 'bottom_ks' in model_params.keys():
+                        model.bottom_ks = model_params['bottom_ks']
+                    if 'dropout' in model_params.keys():
+                        model.do.p = model_params['dropout']
+                    if 'proportional_ks' in model_params.keys():
+                        model.proportional_ks = model_params['proportional_ks']
+                    else:
+                        model.proportional_ks = False
 
-                # Train model
-                preds, labels = fit(model,
-                                    train_set,
-                                    valid_set,
-                                    valid_projects,
-                                    test_set=test_set,
-                                    params=training_params,
-                                    optimizer=optimizer,
-                                    logdir=fold_logdir,
-                                    path=os.path.join(
-                                        self.savedir,
-                                        'model_' + str(k)),
-                                    **loss_params)
+                else:
+                    # Initialize bias of the last layer with the average target value on the train set
+                    print("Initializing model without saved model")
+                    try:
+                        model_params['bias_init'] = torch.nn.Parameter(
+                            torch.Tensor(
+                                np.mean(
+                                    [sample[1] for sample in train_set], axis=0)
+                            ).cuda())
+                    except ValueError:
+                        model_params['bias_init'] = torch.nn.Parameter(
+                            torch.Tensor(
+                                np.mean(
+                                    [sample[1].numpy() for sample in train_set], axis=0)
+                            ).cuda())
+                    model = HE2RNA(**model_params)
+                if self.null_run:
+                    preds, labels = self._predict_without_training(
+                        model, test_set, training_params)
+                    fold_path = os.path.join(self.savedir, 'model_' + str(k))
+                    os.makedirs(fold_path, exist_ok=True)
+                    torch.save(model, os.path.join(fold_path, 'model.pt'))
+                else:
+                    optimizer = self._setup_optimization(model)
+                    loss_params = self._read_loss_params()
+
+                    # Train model
+                    preds, labels = fit(model,
+                                        train_set,
+                                        valid_set,
+                                        valid_projects,
+                                        test_set=test_set,
+                                        params=training_params,
+                                        optimizer=optimizer,
+                                        logdir=fold_logdir,
+                                        path=os.path.join(
+                                            self.savedir,
+                                            'model_' + str(k)),
+                                        **loss_params)
             
             current_indices = test_idx[k]
             full_preds[current_indices] = preds
@@ -1414,10 +1550,51 @@ class Experiment(object):
         
         report = pd.DataFrame(report)
         report_whole_dataset = pd.DataFrame(report_whole_dataset)
-        filename = 'results_per_fold_null.csv' if self.null_run else 'results_per_fold.csv'
-        filename_whole_dataset = 'results_whole_dataset_null.csv' if self.null_run else 'results_whole_dataset.csv'
+        if self.inference:
+            filename = 'results_per_fold_inference.csv'
+            filename_whole_dataset = 'results_whole_dataset_inference.csv'
+        else:
+            filename = 'results_per_fold_null.csv' if self.null_run else 'results_per_fold.csv'
+            filename_whole_dataset = 'results_whole_dataset_null.csv' if self.null_run else 'results_whole_dataset.csv'
         report.to_csv(os.path.join(self.savedir, filename), index=False)
         report_whole_dataset.to_csv(os.path.join(self.savedir, filename_whole_dataset), index=False)
+
+        # Save raw predictions and ground truth concatenated over all test folds
+        if self.inference:
+            patients_array = dataset.patients.values if hasattr(dataset.patients, 'values') else np.array(dataset.patients)
+            test_mask = visited_mask
+            test_patients = patients_array[test_mask]
+            raw_pred_df = pd.DataFrame(full_preds[test_mask].T, index=list(dataset.genes), columns=test_patients)
+            raw_gt_df = pd.DataFrame(full_labels[test_mask].T, index=list(dataset.genes), columns=test_patients)
+            raw_pred_df.to_csv(os.path.join(self.savedir, 'raw_predictions.csv'))
+            raw_gt_df.to_csv(os.path.join(self.savedir, 'raw_ground_truth.csv'))
+
+            # Per-project and overall scatter plots
+            scatter_dir = os.path.join(self.savedir, 'scatter_plots')
+            for project in unique_projects:
+                proj_mask = (all_projects == project) & test_mask
+                if not np.any(proj_mask):
+                    continue
+                proj_title = f'{project}: Predicted vs Ground Truth Gene Expression'
+                out_path = os.path.join(scatter_dir, f'{project}_pred_vs_gt.png')
+                _plot_pred_vs_gt_scatter(
+                    pred_matrix=full_preds[proj_mask],
+                    gt_matrix=full_labels[proj_mask],
+                    gene_names=list(dataset.genes),
+                    title=proj_title,
+                    output_path=out_path,
+                    average_per_gene=False,
+                )
+            overall_title = 'OVERALL: Predicted vs Ground Truth Gene Expression'
+            overall_path = os.path.join(scatter_dir, 'OVERALL_pred_vs_gt.png')
+            _plot_pred_vs_gt_scatter(
+                pred_matrix=full_preds[test_mask],
+                gt_matrix=full_labels[test_mask],
+                gene_names=list(dataset.genes),
+                title=overall_title,
+                output_path=overall_path,
+                average_per_gene=False,
+            )
 
         return report, report_whole_dataset
 
@@ -1443,10 +1620,15 @@ def main():
     parser.add_argument(
         "--null_run", help="skip training and run an untrained/null model",
         action='store_true')
+    parser.add_argument(
+        "--inference", help="run inference only using a saved model specified in the config [main] use_saved_model",
+        action='store_true')
     args = parser.parse_args()
+    if args.null_run and args.inference:
+        raise ValueError("Cannot use --null_run and --inference at the same time.")
     print("Using configuration defined in {}".format(args.config))
     for config in args.config.split(','):
-        exp = Experiment(config, null_run=args.null_run)
+        exp = Experiment(config, null_run=args.null_run, inference=args.inference)
         if args.output_dir:
             exp.savedir = args.output_dir
             if not os.path.exists(exp.savedir):
