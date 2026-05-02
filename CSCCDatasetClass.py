@@ -68,7 +68,8 @@ class CSCCDataset(Dataset):
         genes: Optional[List[str]] = None,
         max_tiles: int = 8000,
         log_transform: bool = True,
-        project_column: str = 'metastasis'
+        project_column: str = 'metastasis',
+        allow_missing_targets: bool = False
     ):
         print(f"\n{'-'*15} Initializing CSCCDataset {'-'*15}\n")
         
@@ -79,6 +80,8 @@ class CSCCDataset(Dataset):
         self.project_column = project_column
         self.keyfile_paths = keyfile_paths.split(',') if keyfile_paths else []
         self.training = False  # Training mode flag for stochastic tile subsampling
+        self.allow_missing_targets = bool(allow_missing_targets)
+        self.has_targets = targets_csv is not None
 
         # Validate that at least one feature source is provided
         if self.features_dir is None and self.features_aggregated is None:
@@ -108,11 +111,19 @@ class CSCCDataset(Dataset):
                 self.feature_files = {str(k): idx for idx, k in enumerate(slide_names)}
             print(f"Indexed {len(self.feature_files)} samples from aggregated H5 file")
         
-        # Load targets and map to study_numbers
-        self.targets_df, self.target_study_numbers = self._load_targets(targets_csv)
-        
-        # Find intersection: patients with both features AND targets
-        self.study_numbers = self._align_patients()
+        if self.has_targets:
+            # Load targets and map to study_numbers
+            self.targets_df, self.target_study_numbers = self._load_targets(targets_csv)
+            # Find intersection: patients with both features AND targets
+            self.study_numbers = self._align_patients()
+        else:
+            if not self.allow_missing_targets:
+                raise ValueError(
+                    "targets_csv is required unless allow_missing_targets=True."
+                )
+            self.targets_df = None
+            self.target_study_numbers = []
+            self.study_numbers = self._align_patients_without_targets()
         
         # For aggregated case, load features into memory to avoid I/O bottlenecks
         if self.aggregated:
@@ -120,14 +131,25 @@ class CSCCDataset(Dataset):
         
         # Select genes
         if genes is None:
+            if not self.has_targets:
+                raise ValueError(
+                    "genes must be provided when targets_csv is missing."
+                )
             # Auto-detect gene columns (adjust pattern as needed)
             self.genes = [c for c in self.targets_df.columns if c not in ['ID', 'study_number']]
             print(f"No gene filter provided. Auto-detected {len(self.genes)} genes")
         else:
-            self.genes = self._filter_genes_by_list(genes)
+            self.genes = self._filter_genes_by_list(genes) if self.has_targets else list(genes)
         
         # Build aligned target matrix
-        self.targets = self._build_target_matrix()
+        if self.has_targets:
+            self.targets = self._build_target_matrix()
+        else:
+            self.targets = np.zeros((len(self.study_numbers), len(self.genes)), dtype=np.float32)
+            print(
+                f"No transcriptome provided. Using zero dummy targets with shape {self.targets.shape} "
+                "for inference-only compatibility."
+            )
         
         # Infer feature dimension
         self.feature_dim = self._get_feature_dim()
@@ -404,6 +426,26 @@ class CSCCDataset(Dataset):
         else:
             print(f"  Aligned {len(study_numbers)} patients with both features and targets")
         return study_numbers
+
+    def _align_patients_without_targets(self) -> List[str]:
+        """Find feature samples without requiring metadata (for true holdout inference)."""
+        print("\nAligning feature samples for inference-only run (no transcriptome targets)")
+        has_features = set(self.feature_files.keys())
+        study_numbers = sorted(list(has_features))
+        if len(study_numbers) == 0:
+            raise ValueError("No feature samples found for inference-only run.")
+        print(f"  Aligned {len(study_numbers)} feature samples for inference-only run")
+        if self.keyfile_paths:
+            metadata_df = self._load_metadata(self.keyfile_paths[0])
+            has_metadata = set(metadata_df.index.astype(str))
+            missing_metadata = has_features - has_metadata
+            if missing_metadata:
+                print(
+                    f"  Note: {len(missing_metadata)} feature samples not found in metadata. "
+                    "This is expected for true holdout samples without keyfile entries."
+                )
+                print(f"    Examples: {list(missing_metadata)[:5]}...")
+        return study_numbers
     
     def _filter_genes_by_list(self, genes: List[str]) -> List[str]:
         """
@@ -536,27 +578,32 @@ class CSCCDataset(Dataset):
             groups: List of lists, each inner list contains study_numbers in that group
             group_labels: Normalized tissue_type for each group (Biopsy/Excision/other)
         """
+        import time
+        t0 = time.time()
+        
         groups = []
         group_labels = []
         
-        # Get pair IDs and tissue types for all study_numbers in the dataset
-        pair_ids = self.metadata.loc[self.study_numbers, 'matching_set_id']
-        tissue_types = self.metadata.loc[self.study_numbers, 'tissue_type']
+        # Get pair IDs and tissue types as numpy arrays for fast indexing
+        # Use positional indexing instead of label-based .loc in loops
+        pair_ids_series = self.metadata.loc[self.study_numbers, 'matching_set_id']
+        tissue_types_series = self.metadata.loc[self.study_numbers, 'tissue_type']
         
-        # Track which study_numbers have been assigned to a group
-        assigned = set()
+        # Create position mapping from study_number to position
+        study_to_pos = {s: i for i, s in enumerate(self.study_numbers)}
+        pair_ids_arr = pair_ids_series.values
+        tissue_types_arr = tissue_types_series.values
         
-        # Build a mapping from pair_id to study_numbers
+        # Build a mapping from pair_id to study_numbers using numpy where possible
         pair_to_studies = {}
-        for study_num in self.study_numbers:
-            pair_id = pair_ids.loc[study_num]
+        for i, study_num in enumerate(self.study_numbers):
+            pair_id = pair_ids_arr[i]
             # Check if pair_id is NaN or missing
             if pd.isna(pair_id):
                 # Singleton group - no pair
                 groups.append([study_num])
-                raw_tissue = tissue_types.loc[study_num]
+                raw_tissue = tissue_types_arr[i]
                 group_labels.append(self._normalize_tissue_type(raw_tissue))
-                assigned.add(study_num)
             else:
                 # Has a pair_id - group together
                 if pair_id not in pair_to_studies:
@@ -567,14 +614,17 @@ class CSCCDataset(Dataset):
         for pair_id, study_list in pair_to_studies.items():
             groups.append(study_list)
             # Use first member's tissue_type for the group label (normalized)
-            raw_tissue = tissue_types.loc[study_list[0]]
+            # Find position of first study number in our array
+            first_study_pos = study_to_pos[study_list[0]]
+            raw_tissue = tissue_types_arr[first_study_pos]
             group_labels.append(self._normalize_tissue_type(raw_tissue))
         
         # Print distribution of stratification labels
         from collections import Counter
         label_counts = Counter(group_labels)
         
-        print(f"Built {len(groups)} sample groups from {len(self.study_numbers)} samples")
+        t1 = time.time()
+        print(f"Built {len(groups)} sample groups from {len(self.study_numbers)} samples ({t1-t0:.3f}s)")
         print(f"  Singleton groups: {sum(1 for g in groups if len(g) == 1)}")
         print(f"  Paired groups: {sum(1 for g in groups if len(g) > 1)}")
         print(f"  Stratification labels: {dict(label_counts)}")
@@ -597,9 +647,11 @@ class CSCCDataset(Dataset):
         for gi in group_indices:
             selected_study_numbers.extend(groups[gi])
         
-        # Map study_numbers to dataset indices
-        indices = np.arange(len(self))
-        return indices[np.isin(self.patients, selected_study_numbers)]
+        # Map study_numbers to dataset indices using a dictionary for O(1) lookup
+        # instead of np.isin which can be O(n*m) for large arrays
+        study_to_idx = {s: i for i, s in enumerate(self.study_numbers)}
+        result_indices = [study_to_idx[s] for s in selected_study_numbers]
+        return np.array(result_indices, dtype=int)
     
     def _safe_stratified_split(
         self, 
@@ -696,14 +748,18 @@ class CSCCDataset(Dataset):
     
     def _print_split_stats(self, train_idx: np.ndarray, valid_idx: np.ndarray, test_idx: np.ndarray):
         """Print tissue_type distribution for each split."""
-        tissue_types = self.metadata.loc[self.study_numbers, 'tissue_type']
+        # Convert to numpy array for faster indexing
+        study_numbers_arr = np.array(self.study_numbers)
+        # Get tissue types as numpy array indexed by position
+        tissue_types_arr = self.metadata.loc[self.study_numbers, 'tissue_type'].values
         
         for name, idx in [('Train', train_idx), ('Valid', valid_idx), ('Test', test_idx)]:
-            split_study_nums = [self.study_numbers[i] for i in idx]
-            split_tissues = tissue_types.loc[split_study_nums]
-            counts = split_tissues.value_counts()
-            pcts = (counts / len(split_tissues) * 100).round(1)
-            print(f"  {name} tissue_type distribution: {dict(zip(counts.index, pcts.values))}%")
+            # Use numpy indexing which is O(1) per element vs pandas .loc list lookups
+            split_tissues = tissue_types_arr[idx]
+            unique, counts = np.unique(split_tissues, return_counts=True)
+            pcts = np.round(counts / len(split_tissues) * 100, 1)
+            dist_dict = {str(u): float(p) for u, p in zip(unique, pcts)}
+            print(f"  {name} tissue_type distribution: {dist_dict}%")
     
     def stratified_kfold(
         self,
@@ -792,13 +848,19 @@ class CSCCDataset(Dataset):
     def projects(self) -> pd.Series:
         """Return the projects in the dataset as a pandas Series, matched to study_number order (study_number is the index)."""
         if self.metadata is None:
-            raise ValueError("Metadata not available. Provide keyfile_paths to access projects.")
+            # For true holdout inference without metadata, return a Series of 'UNKNOWN' values
+            return pd.Series(['UNKNOWN'] * len(self.study_numbers), index=self.study_numbers)
         return self.metadata.loc[self.study_numbers, self.project_column]
     
     @property
     def patients(self) -> np.ndarray:
         """For compatibility with patient_kfold and other split functions."""
         return np.array(self.study_numbers)
+    
+    @property
+    def sample_ids(self) -> list:
+        """For compatibility with match_patient_kfold (alias for study_numbers)."""
+        return self.study_numbers
     
     @property
     def dim(self) -> int:

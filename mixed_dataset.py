@@ -103,10 +103,18 @@ class MixedDataset(Dataset):
 class BalancedDomainBatchSampler(Sampler):
     """
     Produces balanced batches with a fixed CSCC:TCGA ratio (default 1:1).
-    Sampling is with replacement when a domain is exhausted.
+    Sampling is with replacement when a domain is exhausted within an epoch.
+
+    epoch_length controls how many batches constitute one epoch:
+      - 'target' (default): driven by the target/smaller domain (CSCC).
+          Each CSCC slide is seen ~1x per epoch; TCGA rotates across epochs.
+      - 'anchor': driven by the anchor/larger domain (TCGA).
+          Each TCGA slide is seen ~1x per epoch; CSCC is oversampled.
+      - 'max': same as 'anchor' (backward compatible).
     """
 
-    def __init__(self, domain_labels, batch_size, cscc_fraction=0.5, seed=42, drop_last=False):
+    def __init__(self, domain_labels, batch_size, cscc_fraction=0.5,
+                 seed=42, drop_last=False, epoch_length='target'):
         if batch_size < 2:
             raise ValueError("batch_size must be >= 2 for balanced sampling")
         self.domain_labels = np.asarray(domain_labels)
@@ -129,10 +137,28 @@ class BalancedDomainBatchSampler(Sampler):
         self.n_cscc_per_batch = n_cscc
         self.n_tcga_per_batch = n_tcga
 
-        self.batches_per_epoch = math.ceil(
-            max(len(self.cscc_indices) / self.n_cscc_per_batch, len(self.tcga_indices) / self.n_tcga_per_batch)
-        )
+        cscc_batches = math.ceil(len(self.cscc_indices) / self.n_cscc_per_batch)
+        tcga_batches = math.ceil(len(self.tcga_indices) / self.n_tcga_per_batch)
+
+        epoch_length = str(epoch_length).lower()
+        if epoch_length in ('target', 'min'):
+            self.batches_per_epoch = cscc_batches
+        elif epoch_length in ('anchor', 'max'):
+            self.batches_per_epoch = max(cscc_batches, tcga_batches)
+        else:
+            raise ValueError(
+                f"Unknown epoch_length '{epoch_length}'. "
+                "Use 'target', 'anchor', 'min', or 'max'."
+            )
+
+        self._epoch_length_mode = epoch_length
         self.observed_counts = {"cscc": 0, "tcga": 0}
+        print(
+            f"BalancedDomainBatchSampler: {len(self.cscc_indices)} CSCC, "
+            f"{len(self.tcga_indices)} TCGA | "
+            f"{self.n_cscc_per_batch}+{self.n_tcga_per_batch}/batch | "
+            f"epoch_length='{epoch_length}' -> {self.batches_per_epoch} batches/epoch"
+        )
 
     def __len__(self):
         return self.batches_per_epoch
@@ -144,18 +170,23 @@ class BalancedDomainBatchSampler(Sampler):
         rng = np.random.default_rng(self.seed + self.epoch)
         self.observed_counts = {"cscc": 0, "tcga": 0}
 
+        # CSCC is always freshly shuffled each epoch (one full pass in 'target' mode).
         cscc_pool = rng.permutation(self.cscc_indices)
-        tcga_pool = rng.permutation(self.tcga_indices)
         cscc_ptr = 0
+
+        # TCGA: in 'target' mode only a fraction is used per epoch, so we
+        # use a persistent offset seeded by epoch to rotate through TCGA
+        # across epochs rather than always starting from the same samples.
+        tcga_rng = np.random.default_rng(self.seed + self.epoch * 7919)
+        tcga_pool = tcga_rng.permutation(self.tcga_indices)
         tcga_ptr = 0
 
         for _ in range(self.batches_per_epoch):
             if cscc_ptr + self.n_cscc_per_batch > len(cscc_pool):
-                # Replay buffer behavior for depleted domain.
                 cscc_pool = np.concatenate([cscc_pool[cscc_ptr:], rng.permutation(self.cscc_indices)])
                 cscc_ptr = 0
             if tcga_ptr + self.n_tcga_per_batch > len(tcga_pool):
-                tcga_pool = np.concatenate([tcga_pool[tcga_ptr:], rng.permutation(self.tcga_indices)])
+                tcga_pool = np.concatenate([tcga_pool[tcga_ptr:], tcga_rng.permutation(self.tcga_indices)])
                 tcga_ptr = 0
 
             cscc_batch = cscc_pool[cscc_ptr: cscc_ptr + self.n_cscc_per_batch]

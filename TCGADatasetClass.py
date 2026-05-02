@@ -59,14 +59,15 @@ class TCGADataset(Dataset):
     
     def __init__(
         self,
-        targets_csv: str,
+        targets_csv: Optional[str],
         keyfile_path: str,
         features_dir: Optional[str] = None,
         features_aggregated: Optional[str] = None, 
         genes: Optional[List[str]] = None,
         max_tiles: int = 8000,
         log_transform: bool = True,
-        project_filter: list[str] = None
+        project_filter: list[str] = None,
+        allow_missing_targets: bool = False
     ):
         print(f"\n{'-'*15} Initializing TCGADataset {'-'*15}\n")
 
@@ -77,9 +78,12 @@ class TCGADataset(Dataset):
         self.log_transform = log_transform
         self.project_filter = project_filter
         self.genes = genes
+        self.allow_missing_targets = bool(allow_missing_targets)
+        self.has_targets = targets_csv is not None
 
         # Load keyfile and filter by sample type and project if applicable
-        self.filtered_keyfile = self._load_keyfile(keyfile_path, self.project_filter)
+        self.filtered_keyfile_df = self._load_keyfile(keyfile_path, self.project_filter)
+        self.filtered_keyfile = set(self.filtered_keyfile_df['Sample.ID'].values)
         
 
         if self.features_dir is not None:
@@ -100,14 +104,22 @@ class TCGADataset(Dataset):
         else:
             raise ValueError("Either features_dir or features_aggregated must be provided")
 
-        # Load targets and map to sample_ids
-        self.targets_df, self.target_sample_ids = self._load_targets(targets_csv)
-        
-        # Find intersection: patients with both features AND targets
-        self.sample_ids = self._align_patients()
-        
+        if self.has_targets:
+            # Load targets and map to sample_ids
+            self.targets_df, self.target_sample_ids = self._load_targets(targets_csv)
+            # Find intersection: patients with both features AND targets
+            self.sample_ids = self._align_patients()
+        else:
+            if not self.allow_missing_targets:
+                raise ValueError(
+                    "targets_csv is required unless allow_missing_targets=True."
+                )
+            self.targets_df = None
+            self.target_sample_ids = []
+            self.sample_ids = self._align_patients_without_targets()
+
         # TODO Don't think i use this
-        self.sample_ids_truncated = [sid[:15] for sid in self.sample_ids] 
+        self.sample_ids_truncated = [sid[:15] for sid in self.sample_ids]
 
         # For aggregated case, load features into memory to avoid I/O bottlenecks
         if self.aggregated:
@@ -115,26 +127,40 @@ class TCGADataset(Dataset):
 
         # Select genes
         if genes is None:
+            if not self.has_targets:
+                raise ValueError("genes must be provided when targets_csv is missing.")
             # Auto-detect gene columns and exclude metadata columns like File.ID/Case.ID/Project.ID.
             self.genes = [c for c in self.targets_df.columns if str(c).startswith('ENSG')]
             print(f"No gene filter provided. Auto-detected {len(self.genes)} ENSG gene columns")
         else:
-            self.genes = self._filter_genes_by_list(genes)
+            self.genes = self._filter_genes_by_list(genes) if self.has_targets else list(genes)
         
         # Build aligned target matrix
-        self.targets = self._build_target_matrix()
-
-        # Build projects series aligned to sample_ids (one per full sample_id)
-        project_rows = []
-        truncated_to_target_idx = {trunc_id: idx for idx, trunc_id in enumerate(self.targets_df.index)}
-        for full_sid in self.sample_ids:
-            trunc_sid = full_sid[:15]
-            if trunc_sid in truncated_to_target_idx:
-                project_rows.append(truncated_to_target_idx[trunc_sid])
-            else:
-                raise ValueError(f"Truncated sample ID {trunc_sid} (from {full_sid}) not found in targets_df")
-        
-        self.projects = self.targets_df.iloc[project_rows]['Project.ID']
+        if self.has_targets:
+            self.targets = self._build_target_matrix()
+            # Build projects series aligned to sample_ids (one per full sample_id)
+            project_rows = []
+            truncated_to_target_idx = {trunc_id: idx for idx, trunc_id in enumerate(self.targets_df.index)}
+            for full_sid in self.sample_ids:
+                trunc_sid = full_sid[:15]
+                if trunc_sid in truncated_to_target_idx:
+                    project_rows.append(truncated_to_target_idx[trunc_sid])
+                else:
+                    raise ValueError(f"Truncated sample ID {trunc_sid} (from {full_sid}) not found in targets_df")
+            self.projects = self.targets_df.iloc[project_rows]['Project.ID']
+        else:
+            self.targets = np.zeros((len(self.sample_ids), len(self.genes)), dtype=np.float32)
+            project_map = {}
+            for _, row in self.filtered_keyfile_df.iterrows():
+                sid = str(row['Sample.ID'])
+                project_map[sid] = row['Project.ID']
+                project_map[sid[:15]] = row['Project.ID']
+            projects = [project_map.get(str(sid), project_map.get(str(sid)[:15], 'UNKNOWN')) for sid in self.sample_ids]
+            self.projects = pd.Series(projects)
+            print(
+                f"No transcriptome provided. Using zero dummy targets with shape {self.targets.shape} "
+                "for inference-only compatibility."
+            )
         # Infer feature dimension
         self.feature_dim = self._get_feature_dim()
         
@@ -166,7 +192,7 @@ class TCGADataset(Dataset):
             print("  Warning: 'Sample.Type' column not found in keyfile. Skipping Sample.Type filtering.")
             
         # Convert to set for O(1) lookup performance
-        return set(keyfile['Sample.ID'].values)
+        return keyfile
 
     def _index_features(self) -> dict:
         """Map sample_id -> npy file path."""
@@ -420,6 +446,41 @@ class TCGADataset(Dataset):
         else:
             print(f"  Aligned {len(sample_ids)} feature samples with targets")
         
+        return sample_ids
+
+    def _align_patients_without_targets(self) -> List[str]:
+        """Find feature samples that have keyfile metadata in inference-only mode."""
+        print("\nAligning features with keyfile metadata (no transcriptome targets)")
+
+        def build_base_dict(ids):
+            base_dict = {}
+            for sid in ids:
+                sid = str(sid)
+                base = sid[:15]
+                if base not in base_dict:
+                    base_dict[base] = set()
+                base_dict[base].add(sid)
+            return base_dict
+
+        feature_ids = list(self.feature_files.keys())
+        keyfile_ids = self.filtered_keyfile_df['Sample.ID'].astype(str).tolist()
+        features_by_base = build_base_dict(feature_ids)
+        keyfile_by_base = build_base_dict(keyfile_ids)
+
+        valid = set()
+        for base in features_by_base.keys() & keyfile_by_base.keys():
+            valid.update(features_by_base[base])
+        missing_metadata = set(feature_ids) - valid
+        if missing_metadata:
+            print(
+                f"  Warning: {len(missing_metadata)} feature samples have no matching keyfile rows after filtering"
+            )
+            print(f"    Missing metadata examples: {list(missing_metadata)[:10]}...")
+
+        sample_ids = sorted(list(valid))
+        if len(sample_ids) == 0:
+            raise ValueError("No feature samples found after keyfile filtering in inference-only mode.")
+        print(f"  Aligned {len(sample_ids)} feature samples with keyfile metadata")
         return sample_ids
     
     def _filter_genes_by_list(self, genes: List[str]) -> List[str]:
@@ -1120,7 +1181,7 @@ def match_patient_kfold(dataset, splits_path: str) -> Tuple[List[np.ndarray], Li
 
 if __name__ == "__main__":
     # features_dir = "/gpfs/work4/0/prjs1086/pepsi/data/processed/tcga_resnet_feats"
-    features_aggregated = "/home/dvanerp/pepsi/data/processed/tcga_supertiles.h5"
+    features_aggregated = "/home/dvanerp/pepsi/data/processed/tcga_UNI2_supertiles_newclass_feb16.h5"
     # targets_csv = "/home/dvanerp/pepsi/data/raw/tcga_rna/tcga_all_transcriptomes_tpm_10782.csv"
     targets_csv = "/home/dvanerp/pepsi/data/raw/tcga_rna/tcga_all_transcriptomes_tpm_10782_first5last5.csv"
     keyfile_path = "/home/dvanerp/pepsi/data/raw/manifests/new_keyfiles/new_master_keyfile.csv"
@@ -1149,7 +1210,10 @@ if __name__ == "__main__":
 
     # Compatible with your existing patient_kfold
     print(f"First 16 sample IDs: \n{dataset.patients[:16]}")
-    print(f"Unique Projects:\n{dataset.projects.unique()}")
+    project_counts = dataset.projects.value_counts()
+    print("Unique Projects and Sample Counts:")
+    for project, count in project_counts.items():
+        print(f"  {project}: {count}")
 
     # loader = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=4, collate_fn=cscc_collate_with_ids)
     loader = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=4)
