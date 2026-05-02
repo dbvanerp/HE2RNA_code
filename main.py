@@ -33,6 +33,7 @@ import torch
 from torch import nn
 from torch.utils.data import Subset, DataLoader
 from torch import optim
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau, LinearLR, SequentialLR
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, ShuffleSplit
 from utils import compute_metrics, summarize_class, save_patient_splits, _plot_pred_vs_gt_scatter
@@ -44,7 +45,7 @@ from CSCCDatasetClass import CSCCDataset
 from TCGADatasetClass import TCGADataset, match_patient_kfold, match_patient_single
 from mixed_dataset import MixedDataset, BalancedDomainBatchSampler
 from model import HE2RNA, fit, predict
-from constant import PATH_TO_TILES
+# from constant import PATH_TO_TILES
 
 
 class Experiment(object):
@@ -63,7 +64,8 @@ class Experiment(object):
         # Read configuration file
         self.config = configparser.ConfigParser()
         self.config.read(configfile)
-
+        
+        # For debugging purposes, print the parsed config
         print("========== Loaded Config ==========")
         for section in self.config.sections():
             print(f"[{section}]")
@@ -112,6 +114,20 @@ class Experiment(object):
         else:
             self.splits = None
 
+        data_section = self.config['data'] if 'data' in self.config.sections() else {}
+        self.has_transcriptome = (
+            ('path_to_transcriptome' in data_section.keys())
+            and bool(str(data_section['path_to_transcriptome']).strip())
+        )
+        self.true_holdout_no_transcriptome = (
+            self.inference
+            and (self.splits is None)
+            and (self.split is None)
+            and (not self.has_transcriptome)
+        )
+        if self.true_holdout_no_transcriptome:
+            self._print_no_transcriptome_inference_warning()
+
         if 'subsample' in self.config['main'].keys():
             self.subsample = float(self.config['main']['subsample'])
         else:
@@ -129,7 +145,7 @@ class Experiment(object):
         if self.data_mode not in supported_modes:
             raise ValueError(f"Unsupported data_mode '{self.data_mode}'. Expected one of {supported_modes}.")
         self.default_anchor_projects = [
-            'TCGA-HNSC', 'TCGA-LUSC', 'TCGA-CESC', 'TCGA-ESCA', 'TCGA-BLCA'
+            'TCGA-HNSC', 'TCGA-LUSC', 'TCGA-CESC', 'TCGA-ESCA'
         ]
 
         if 'p_value' in self.config['main'].keys():
@@ -229,13 +245,50 @@ class Experiment(object):
                 return projects
         return self.default_anchor_projects
 
+    def _setup_scheduler(self, optimizer):
+        """Create and return a learning rate scheduler based on config.
+
+        Returns None if no scheduler is configured.
+        """
+        if 'scheduler' not in self.config.sections():
+            return None
+
+        cfg = self.config['scheduler']
+        name = cfg.get('scheduler', 'none').lower()
+
+        if name == 'none' or name == '':
+            return None
+
+        if name == 'cosine':
+            T_max = int(cfg.get('T_max', '100'))
+            eta_min = float(cfg.get('eta_min', '1e-6'))
+            warmup_epochs = int(cfg.get('warmup_epochs', '0'))
+
+            cosine = CosineAnnealingLR(optimizer, T_max=T_max, eta_min=eta_min)
+
+            if warmup_epochs > 0:
+                warmup = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs)
+                return SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_epochs])
+            return cosine
+
+        if name == 'plateau':
+            factor = float(cfg.get('factor', '0.5'))
+            plateau_patience = int(cfg.get('plateau_patience', '10'))
+            mode = cfg.get('mode', 'max')  # 'max' for correlation, 'min' for loss
+            return ReduceLROnPlateau(optimizer, mode=mode, factor=factor, patience=plateau_patience)
+
+        raise ValueError(f"Unknown scheduler: {name}. Supported: cosine, plateau, none")
+
     def _setup_optimization(self, model, override_lr=None):
+        """Create optimizer and scheduler, returning them as a tuple."""
         if 'optimization' in self.config.sections():
             dic = self.config['optimization']
             base_lr = float(dic['lr']) if override_lr is None else float(override_lr)
             weight_decay = float(dic['weight_decay']) if 'weight_decay' in dic.keys() else 0.0
-            optimizer_name = dic['optimizer']
+            optimizer_name = dic.get('optimizer', 'adam').lower()
             use_diff_lr = self._read_bool('optimization', 'differential_lr', default=False)
+
+            optimizer = None
 
             if use_diff_lr and hasattr(model, 'layers') and len(model.layers) > 1:
                 head_lr_mult = float(dic['head_lr_multiplier']) if 'head_lr_multiplier' in dic.keys() else 5.0
@@ -253,24 +306,40 @@ class Experiment(object):
                 )
                 if optimizer_name == 'sgd':
                     momentum = float(dic['momentum']) if 'momentum' in dic.keys() else 0.9
-                    return optim.SGD(param_groups, momentum=momentum, nesterov=True, weight_decay=weight_decay)
-                if optimizer_name == 'adam':
-                    return optim.Adam(param_groups, weight_decay=weight_decay)
-                raise ValueError(f"Unsupported optimizer '{optimizer_name}'")
+                    optimizer = optim.SGD(param_groups, momentum=momentum, nesterov=True, weight_decay=weight_decay)
+                elif optimizer_name == 'adam':
+                    optimizer = optim.Adam(param_groups, weight_decay=weight_decay)
+                elif optimizer_name == 'adamw':
+                    optimizer = optim.AdamW(param_groups, weight_decay=weight_decay)
+                else:
+                    raise ValueError(f"Unsupported optimizer '{optimizer_name}'")
+            else:
+                optim_params = {'params': model.parameters(), 'lr': base_lr}
+                if 'momentum' in dic.keys():
+                    optim_params['momentum'] = float(dic['momentum'])
+                    optim_params['nesterov'] = True
+                if 'weight_decay' in dic.keys():
+                    optim_params['weight_decay'] = weight_decay
 
-            optim_params = {'params': model.parameters(), 'lr': base_lr}
-            if 'momentum' in dic.keys():
-                optim_params['momentum'] = float(dic['momentum'])
-                optim_params['nesterov'] = True
-            if 'weight_decay' in dic.keys():
-                optim_params['weight_decay'] = weight_decay
+                if optimizer_name == 'sgd':
+                    optimizer = optim.SGD(**optim_params)
+                elif optimizer_name == 'adam':
+                    optimizer = optim.Adam(**optim_params)
+                elif optimizer_name == 'adamw':
+                    optimizer = optim.AdamW(**optim_params)
+                else:
+                    raise ValueError(f"Unsupported optimizer '{optimizer_name}'")
 
-            if optimizer_name == 'sgd':
-                return optim.SGD(**optim_params)
-            if optimizer_name == 'adam':
-                return optim.Adam(**optim_params)
-            raise ValueError(f"Unsupported optimizer '{optimizer_name}'")
-        return optim.Adam(model.parameters(), lr=1e-3)
+            # Create scheduler after optimizer is created
+            scheduler = self._setup_scheduler(optimizer)
+            if scheduler is not None:
+                print(f"Using scheduler: {type(scheduler).__name__}")
+
+            return optimizer, scheduler
+
+        # Default: Adam optimizer, no scheduler
+        optimizer = optim.Adam(model.parameters(), lr=1e-3)
+        return optimizer, None
 
     def _load_saved_model_for_fold(self, fold_idx, model_params):
         if not self.use_saved_model:
@@ -397,12 +466,14 @@ class Experiment(object):
         mixed_train_set = MixedDataset(cscc_subset, tcga_subset)
         # Set training mode for stochastic tile subsampling (different tiles each epoch)
         mixed_train_set.train()
+        epoch_length = self.config.get('training', 'epoch_length', fallback='target')
         sampler = BalancedDomainBatchSampler(
             domain_labels=mixed_train_set.domain_labels,
             batch_size=batch_size,
             cscc_fraction=0.5,
             seed=seed,
-            drop_last=False
+            drop_last=False,
+            epoch_length=epoch_length
         )
         # Allow workers by default; only force 0 for high-risk configurations
         # unless user explicitly overrides this behavior.
@@ -461,6 +532,7 @@ class Experiment(object):
         assert 'data' in self.config.sections(), \
             "'data' not found in config file"
         dic = self.config['data']
+        transcriptome_path = dic['path_to_transcriptome'] if 'path_to_transcriptome' in dic.keys() else None
 
         if 'genes' in dic.keys():
             genes = dic['genes']
@@ -481,6 +553,11 @@ class Experiment(object):
 
         # CSCC mode: load full dataset using CSCCDataset class
         if self.data_mode == 'cscc':
+            if transcriptome_path is None and not self.true_holdout_no_transcriptome:
+                raise ValueError(
+                    "CSCC mode requires [data] path_to_transcriptome unless running "
+                    "in inference mode with no splits (true-holdout inference)."
+                )
             cscc_path_to_data = dic['path_to_data']
             project_column = dic['project_column']
 
@@ -488,20 +565,22 @@ class Experiment(object):
             if os.path.isdir(cscc_path_to_data):
                 dataset = CSCCDataset(
                     features_dir=cscc_path_to_data,
-                    targets_csv=dic['path_to_transcriptome'],
+                    targets_csv=transcriptome_path,
                     keyfile_paths=dic['keyfile_path'],
                     genes=genes,
                     project_column=project_column,
+                    allow_missing_targets=self.true_holdout_no_transcriptome,
                 )
             elif cscc_path_to_data.endswith('.h5'):
                 # Aggregated CSCC H5: use same 100-tile convention as aggregated TCGA
                 dataset = CSCCDataset(
                     features_aggregated=cscc_path_to_data,
-                    targets_csv=dic['path_to_transcriptome'],
+                    targets_csv=transcriptome_path,
                     keyfile_paths=dic['keyfile_path'],
                     genes=genes,
                     max_tiles=100,
                     project_column=project_column,
+                    allow_missing_targets=self.true_holdout_no_transcriptome,
                 )
             else:
                 raise ValueError(f"Unsupported path_to_data format for CSCC: {cscc_path_to_data}")
@@ -509,13 +588,18 @@ class Experiment(object):
             print(
                 "Data mode: CSCC. Loading from "
                 f"{os.path.basename(dic['path_to_data'])}, "
-                f"{os.path.basename(dic['path_to_transcriptome'])}, "
+                f"{os.path.basename(transcriptome_path) if transcriptome_path else 'NO_TRANSCRIPTOME'}, "
                 f"{os.path.basename(dic['keyfile_path'])}"
             )
             summarize_class(dataset)
             return dataset 
 
         elif self.data_mode == 'tcga':
+            if transcriptome_path is None and not self.true_holdout_no_transcriptome:
+                raise ValueError(
+                    "TCGA mode requires [data] path_to_transcriptome unless running "
+                    "in inference mode with no splits (true-holdout inference)."
+                )
             path_to_data = dic['path_to_data']
 
             # Convert project_filter from comma-separated string to list, if present
@@ -527,27 +611,33 @@ class Experiment(object):
                 print(f"Loading TCGA dataset from features directory: {path_to_data}\nMax tiles = 8000")
                 features_dir = path_to_data
                 dataset = TCGADataset(
-                    targets_csv=dic['path_to_transcriptome'],
+                    targets_csv=transcriptome_path,
                     keyfile_path=dic['keyfile_path'],
                     features_dir=features_dir,
                     genes=genes,
                     project_filter=project_filter,
-                    max_tiles=8000
+                    max_tiles=8000,
+                    allow_missing_targets=self.true_holdout_no_transcriptome,
                 )
             elif path_to_data.endswith('.h5'):
                 print(f"Loading TCGA dataset from aggregated H5 file: {path_to_data}\nMax tiles = 100")
                 features_aggregated = path_to_data
                 dataset = TCGADataset(
-                    targets_csv=dic['path_to_transcriptome'],
+                    targets_csv=transcriptome_path,
                     keyfile_path=dic['keyfile_path'],
                     features_aggregated=features_aggregated,
                     genes=genes,
                     project_filter=project_filter,
-                    max_tiles = 100
+                    max_tiles = 100,
+                    allow_missing_targets=self.true_holdout_no_transcriptome,
                 )
             else:
                 raise ValueError(f"Unsupported path_to_data format for TCGA: {path_to_data}")
-            print(f"Data mode: TCGA. Loaded from {os.path.basename(dic['path_to_data'])}, {os.path.basename(dic['path_to_transcriptome'])}, {os.path.basename(dic['keyfile_path'])}")
+            print(
+                f"Data mode: TCGA. Loaded from {os.path.basename(dic['path_to_data'])}, "
+                f"{os.path.basename(transcriptome_path) if transcriptome_path else 'NO_TRANSCRIPTOME'}, "
+                f"{os.path.basename(dic['keyfile_path'])}"
+            )
             
             return dataset
 
@@ -617,127 +707,6 @@ class Experiment(object):
                 'mixed_dataset': mixed_dataset,
                 'anchor_projects': tcga_projects,
             }
-
-        print("WARNING: IF THIS PRINTS, YOU ARE BACK TO WSI_DATA AND TRANSCRIPTOME_DATA INSTEAD OF THE BEAUTIFUL SHINY NEW TCGADataset/CSCCDataset")    
-        
-        if 'path_to_transcriptome' in dic.keys() and 'projectname' in dic.keys():
-            projectname = dic['projectname'].split(',')
-            transcriptome_data = TranscriptomeDataset.from_saved_file(
-                dic['path_to_transcriptome'], projectname=projectname, genes=genes)
-        elif 'path_to_transcriptome' in dic.keys():
-            print(f"Loading transcriptome data via TranscriptomeDataset.from_saved_file() from {dic['path_to_transcriptome']} \nNo projects given in config, using all\n Length of gene filter: {None if genes is None else len(genes)}")
-            transcriptome_data = TranscriptomeDataset.from_saved_file(
-                dic['path_to_transcriptome'], genes=genes)
-        elif 'projectname' in dic.keys():
-            projectname = dic['projectname'].split(',')
-            print(f"Loading transcriptome data via TranscriptomeDataset(projectname, genes) from {dic['path_to_transcriptome']} \nProjects given in config: {projectname}\n Length of gene filter: {None if genes is None else len(genes)}")
-            transcriptome_data = TranscriptomeDataset(projectname, genes)
-            transcriptome_data.load_transcriptomes()
-        else:
-            print(f"No projects or path to transcriptome given in config, building from scratch with TranscriptomeDataset(None, genes)\n Length of gene filter: {None if genes is None else len(genes)}")
-            transcriptome_data = TranscriptomeDataset(None, genes)
-            transcriptome_data.load_transcriptomes()
-
-        if 'path_to_data' in dic.keys():
-
-            if dic['path_to_data'].endswith('.pkl'):
-                X = pkl.load(open(dic['path_to_data'], 'rb'))
-                y, genes, patients, projects = load_labels(transcriptome_data)
-                dataset = AggregatedDataset(
-                    genes, patients, projects,
-                    torch.Tensor(X), torch.Tensor(y))
-            elif dic['path_to_data'].endswith('.h5'):
-                print("Loading labels of the following transcriptome_data:")
-                summarize_class(transcriptome_data)
-                
-                y, genes, patients, projects = load_labels(transcriptome_data)
-                # for i, patient in tqdm(list(enumerate(patients)), desc='Iterating over patients'):
-                #     gene_expr_raw = transcriptome_data.transcriptomes['ENSG00000000003.15'][i]
-                #     gene_expr_log = np.log10(1 + gene_expr_raw)
-                #     # Only print if log10(1 + gene_expr_raw) from above does not match y[i][0] (rounded to 4 decimals)
-                #     # or if the patient names do not match
-                #     log_eq = round(gene_expr_log, 4) == round(y[i][0], 4)
-                #     patient_eq = str(patient) == str(transcriptome_data.transcriptomes['Case.ID'][i])
-                #     mismatch_count = 0
-                #     if not log_eq or not patient_eq:
-                #         mismatch_count += 1
-                #         print("Shape of y: ", y.shape, "Shape of y[i]: ", y[i].shape)
-                #         print("From after load_labels / transcriptome_data.dataset:")
-                #         print(f"Patient {i}: {patient} / {transcriptome_data.transcriptomes['Case.ID'][i]}")
-                #         print(f"Patient {i} ENSG...3.15 expression: {genes[0]} / y (log): {y[i][0]} / transcriptome raw: {gene_expr_raw} / transcriptome log10(1+x): {gene_expr_log}")
-                    
-                
-                # if mismatch_count == 0:
-                #     print("No mismatches found, indexes of transcriptome data match")
-                # else:
-                #     print(f"Total mismatch count: {mismatch_count}")
-                #     raise ValueError("Mismatch found in transcriptome data. Please check input files and index matching.")
-
-
-                dataset = H5Dataset.match_transcriptome_data(
-                    transcriptome_data, dic['path_to_data'], in_memory=True)
-                
-                print(f"Shape of dataset.data: {dataset.data.shape}")
-                # Print headers of dataset.data: print shape and sample information in a loop (num_samples, tile_dim, num_tiles)
-                # for idx in range(25):  # print first 3 samples as a header preview
-                #     print(f"Sample {idx}: patient {dataset.patients[idx]}")
-                #     print(f"Sample {idx}: project {dataset.projects[idx]}")
-                #     print(f"Sample {idx}: gene expression from self.targets: {dataset.targets[idx]} from y: {y[idx]}")
-                    # print(idx, dataset.data[idx][:10]) # print first 10 entries of each sample
-
-            # checking loaded transcriptomes and tile features against original file
-            df = pd.read_csv('/home/dvanerp/pepsi/data/processed/tcga_rna/tcga_full_transcriptome_uni_filtered_ensembl_subset_log.csv')
-            
-            with h5py.File(dic['path_to_data'], 'r') as f:
-                if dataset.indices is not None:
-                    # h5py requires indices to be in increasing order
-                    sort_idx = np.argsort(dataset.indices)
-                    rev_idx = np.argsort(sort_idx)
-                    og_h5 = f['X'][dataset.indices[sort_idx], 0, 3:]
-                    # Restore original metadata order
-                    og_h5 = og_h5[rev_idx]
-                    
-                    # Also filter the check-dataframe to match
-                    df = df.iloc[dataset.indices].reset_index(drop=True)
-                else:
-                    og_h5 = f['X'][:, 0, 3:]
-            
-            print("Shape of og_h5 for checking: ", og_h5.shape)
-            print(f"Shape of dataset.data: {dataset.data.shape}")
-            print(f"Length of targets: {len(dataset.targets)}")
-            
-            # Check dataset.targets against the dataframe for first (ENSG00000000003.15) and last (ENSG00000288675.1) gene columns
-            mismatch_found = False
-            for idx in range(len(dataset.targets)):
-                target_first = dataset.targets[idx][0]
-                target_last = dataset.targets[idx][-1]
-                df_first = df.iloc[idx]["ENSG00000000003.15"]
-                df_last = df.iloc[idx]["ENSG00000288675.1"]
-
-                # 2048 numpy features of dataset.data at idx tile 0
-                data_features = dataset.data[idx][:, 0].cpu().numpy() if hasattr(dataset.data[idx][:, 0], 'cpu') else dataset.data[idx][:, 0].numpy()
-                og_features = og_h5[idx][:]
-                
-                # Compare data_features and og_features for exact match
-                if not np.array_equal(data_features, og_features):
-                    print(f"features mismatch at idx {idx}, patient {dataset.patients[idx]}")
-                    print("mean of data_features: ", np.mean(data_features), "mean of og_features: ", np.mean(og_features))
-                    mismatch_found = True
-
-                # Compare using float tolerance
-                if not (abs(target_first - df_first) < 1e-4 and abs(target_last - df_last) < 1e-4):
-                    print(f"transcriptome mismatch at idx {idx}, patient {dataset.patients[idx]}: target_first={target_first}, df_first={df_first}, target_last={target_last}, df_last={df_last}")
-                    mismatch_found = True
-            
-            if not mismatch_found:
-                print("Successfully verified transcriptome and features match for all samples in dataset")
-            print("Completed checking for transcriptome and features mismatches")
-
-        else:
-            dataset = TCGAFolder.match_transcriptome_data(
-                transcriptome_data)
-
-        return dataset
 
     def _cross_validation_mixed_outer(self, n_folds=5, random_state=0, logdir='exp'):
         model_params = self._read_architecture()
@@ -820,7 +789,7 @@ class Experiment(object):
                     os.makedirs(fold_path, exist_ok=True)
                     torch.save(model, os.path.join(fold_path, 'model.pt'))
                 else:
-                    optimizer = self._setup_optimization(model)
+                    optimizer, scheduler = self._setup_optimization(model)
                     loss_params = self._read_loss_params()
                     preds, labels = fit(
                         model,
@@ -830,6 +799,7 @@ class Experiment(object):
                         test_set=test_set,
                         params=training_params,
                         optimizer=optimizer,
+                        scheduler=scheduler,
                         logdir=fold_logdir,
                         path=os.path.join(self.savedir, 'model_' + str(k)),
                         train_loader=train_loader,
@@ -867,6 +837,8 @@ class Experiment(object):
         print(f"Visited {pct_visited:.2f}% of CSCC patients during cross-validation.")
         all_projects = np.array([str(x).replace('_', '-') for x in cscc_dataset.projects.values])
         unique_projects = np.unique(all_projects)
+
+        # Compute correlations for the whole dataset as a *concatenation* of cross-validation folds
         report_whole_dataset = {'gene': list(cscc_dataset.genes)}
         for project in unique_projects:
             pred = full_preds[all_projects == project]
@@ -924,6 +896,17 @@ class Experiment(object):
         return report, report_whole_dataset
 
     def _cross_validation_mixed_nested(self, n_folds=5, random_state=0, logdir='exp'):
+        """
+        Nested cross-validation for mixed mode: 
+        Outer loop: split CSCC samples into n_folds.
+        Inner loop: split CSCC samples into inner_folds.
+        For each inner fold, train a model and evaluate on the inner valid set.
+        Select the best learning rate from the inner loop and retrain on the entire inner train set.
+        Evaluate on the outer test set.
+        Repeat for all outer folds.
+        Return the best model and the metrics.
+        Not tested in its entirety.
+        """
         model_params = self._read_architecture()
         training_params = self._read_training_params()
         data_bundle = self._build_dataset()
@@ -992,7 +975,7 @@ class Experiment(object):
                     valid_projects_inner = valid_projects_inner.astype('category').cat.codes.values.astype('int64')
 
                     model = self._initialize_model(cp.deepcopy(model_params), train_set_cscc, k)
-                    optimizer = self._setup_optimization(model, override_lr=cand_lr)
+                    optimizer, scheduler = self._setup_optimization(model, override_lr=cand_lr)
                     loss_params = self._read_loss_params()
                     preds_inner, labels_inner = fit(
                         model,
@@ -1002,6 +985,7 @@ class Experiment(object):
                         test_set=valid_set_inner,
                         params=training_params,
                         optimizer=optimizer,
+                        scheduler=scheduler,
                         logdir=fold_logdir,
                         path=None,
                         train_loader=train_loader,
@@ -1041,7 +1025,7 @@ class Experiment(object):
             )
             train_set_cscc = Subset(cscc_dataset, retrain_train_idx)
             model = self._initialize_model(cp.deepcopy(model_params), train_set_cscc, k)
-            optimizer = self._setup_optimization(model, override_lr=best_lr)
+            optimizer, scheduler = self._setup_optimization(model, override_lr=best_lr)
             fold_logdir = os.path.join(logdir, f'outer_fold_{k}')
             os.makedirs(fold_logdir, exist_ok=True)
             loss_params = self._read_loss_params()
@@ -1053,6 +1037,7 @@ class Experiment(object):
                 test_set=test_set,
                 params=training_params,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 logdir=fold_logdir,
                 path=os.path.join(self.savedir, 'model_' + str(k)),
                 train_loader=train_loader,
@@ -1221,7 +1206,7 @@ class Experiment(object):
                     model, test_set, training_params)
                 torch.save(model, os.path.join(self.savedir, 'model_null.pt'))
             else:
-                optimizer = self._setup_optimization(model)
+                optimizer, scheduler = self._setup_optimization(model)
                 loss_params = self._read_loss_params()
                 preds, labels = fit(model,
                                     train_set,
@@ -1230,6 +1215,7 @@ class Experiment(object):
                                     test_set=test_set,
                                     params=training_params,
                                     optimizer=optimizer,
+                                    scheduler=scheduler,
                                     logdir=logdir,
                                     path=self.savedir,
                                     **loss_params)
@@ -1288,7 +1274,15 @@ class Experiment(object):
         return report
 
     def cross_validation(self, n_folds=5, random_state=0, logdir='exp'):
-        """N-fold cross-validation."""
+        """
+        N-fold cross-validation.
+        Function is always called when --cross_validation is specified,
+        but true holdout inference and mixed mode are immediately handed off to specific functions.
+        """
+        if self.true_holdout_no_transcriptome:
+            return self._cross_validation_true_holdout_no_transcriptome(
+                n_folds=n_folds, random_state=random_state, logdir=logdir
+            )
         if self.data_mode == 'mixed_cscc_tcga_anchor':
             use_nested = self._read_bool('training', 'nested_cv', default=False)
             if use_nested and not self.inference:
@@ -1334,15 +1328,12 @@ class Experiment(object):
             else:
                 raise ValueError(f"Invalid data mode: {self.data_mode}")
         else:
-            # match_patient_kfold for now is defined only in the TCGA Dataset class.
-            # TODO check the zipping and unpickling of the splits file
-            # TODO check if match_patient_kfold also works for CSCC 
             print(f"Using provided splits file")
             train_patients, valid_patients, test_patients = self.splits
             splits = (train_patients, valid_patients, test_patients)
             train_idx, valid_idx, test_idx = match_patient_kfold(dataset, splits)
 
-        if self.data_mode != 'cscc':
+        if self.data_mode == 'tcga':
             dic = {}
             for project in dataset.projects.unique():
                 if project in ['TCGA-LUAD', 'TCGA-LUSC', 'TCGA_LUAD', 'TCGA_LUSC']:
@@ -1480,7 +1471,7 @@ class Experiment(object):
                     os.makedirs(fold_path, exist_ok=True)
                     torch.save(model, os.path.join(fold_path, 'model.pt'))
                 else:
-                    optimizer = self._setup_optimization(model)
+                    optimizer, scheduler = self._setup_optimization(model)
                     loss_params = self._read_loss_params()
 
                     # Train model
@@ -1491,12 +1482,13 @@ class Experiment(object):
                                         test_set=test_set,
                                         params=training_params,
                                         optimizer=optimizer,
+                                        scheduler=scheduler,
                                         logdir=fold_logdir,
                                         path=os.path.join(
                                             self.savedir,
                                             'model_' + str(k)),
                                         **loss_params)
-            
+
             current_indices = test_idx[k]
             full_preds[current_indices] = preds
             full_labels[current_indices] = labels
@@ -1598,6 +1590,71 @@ class Experiment(object):
 
         return report, report_whole_dataset
 
+    def _print_no_transcriptome_inference_warning(self):
+        print("\n" + "=" * 96)
+        print("WARNING: INFERENCE IS RUNNING WITHOUT path_to_transcriptome (TRUE HOLDOUT MODE).")
+        print("No ground truth is available, so correlation metrics will NOT be computed.")
+        print("No results_per_fold.csv/results_whole_dataset.csv/raw_ground_truth.csv will be written.")
+        print("The run will predict every sample for every fold model and average raw predictions.")
+        print("=" * 96 + "\n")
+
+    def _cross_validation_true_holdout_no_transcriptome(self, n_folds=5, random_state=0, logdir='exp'):
+        if self.data_mode == 'mixed_cscc_tcga_anchor':
+            raise ValueError(
+                "True holdout no-transcriptome inference is not supported for mixed mode."
+            )
+        model_params = self._read_architecture()
+        training_params = self._read_training_params()
+        dataset = self._build_dataset()
+        model_params['input_dim'] = dataset.dim
+        model_params['output_dim'] = len(dataset.genes)
+        n_samples = len(dataset)
+        n_genes = model_params['output_dim']
+        print(
+            f"Running true-holdout inference with {n_folds} folds over {n_samples} samples "
+            f"and {n_genes} genes."
+        )
+        fold_pred_list = []
+        for k in range(n_folds):
+            print(f"Running holdout inference for fold {k} on all samples...")
+            model = self._load_saved_model_for_fold(k, cp.deepcopy(model_params))
+            if model is None:
+                raise ValueError(
+                    f"Could not load saved model for fold {k} from {self.use_saved_model}"
+                )
+            preds, _ = self._predict_without_training(model, dataset, training_params)
+            if preds.shape[0] != n_samples:
+                raise ValueError(
+                    f"Fold {k} prediction sample count mismatch: expected {n_samples}, got {preds.shape[0]}"
+                )
+            print(f"Fold {k} prediction shape: {preds.shape}")
+            fold_pred_list.append(preds.astype(np.float32))
+        fold_preds = np.stack(fold_pred_list, axis=0)
+        avg_preds = np.mean(fold_preds, axis=0)
+        print(f"Fold prediction tensor shape: {fold_preds.shape}")
+        print(f"Averaged prediction matrix shape: {avg_preds.shape}")
+        patients_array = dataset.patients.values if hasattr(dataset.patients, 'values') else np.array(dataset.patients)
+        if len(patients_array) != n_samples:
+            raise ValueError(
+                f"Patient/sample count mismatch: expected {n_samples}, got {len(patients_array)}"
+            )
+        raw_pred_df = pd.DataFrame(
+            avg_preds.T,
+            index=list(dataset.genes),
+            columns=patients_array
+        )
+        output_path = os.path.join(self.savedir, 'raw_predictions.csv')
+        raw_pred_df.to_csv(output_path)
+        print(f"Saved fold-averaged raw predictions to {output_path}")
+        report = pd.DataFrame({
+            'mode': ['true_holdout_no_transcriptome_inference'],
+            'n_samples': [n_samples],
+            'n_genes': [n_genes],
+            'n_folds': [n_folds],
+        })
+        report_whole_dataset = report.copy()
+        return report, report_whole_dataset
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1627,6 +1684,8 @@ def main():
     if args.null_run and args.inference:
         raise ValueError("Cannot use --null_run and --inference at the same time.")
     print("Using configuration defined in {}".format(args.config))
+
+    # Main loop. Supports multiple configs in a single call.
     for config in args.config.split(','):
         exp = Experiment(config, null_run=args.null_run, inference=args.inference)
         if args.output_dir:
